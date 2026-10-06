@@ -485,6 +485,11 @@
   font-size: 10.5px !important;
   color: #a1a1aa !important;
 }
+.ann-sb__row-missing {
+  font-size: 10.5px !important;
+  color: #b45309 !important;
+  font-weight: 600 !important;
+}
 .ann-sb__row-dot {
   width: 2px !important;
   height: 2px !important;
@@ -1015,6 +1020,11 @@
 }
 
 /* ── Tag editor overlay ───────────────────────────────────────────────────── */
+/* El atributo hidden debe ganar a los display:… !important de este archivo */
+#ann-sidebar [hidden] {
+  display: none !important;
+}
+
 .ann-sb__overlay {
   position: absolute !important;
   inset: 0 !important;

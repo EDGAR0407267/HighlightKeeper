@@ -52,15 +52,16 @@ Unlike temporary browser highlights, this extension **stores highlights locally 
 
 # Key Features
 
-- Persistent text highlighting
-- Multiple highlight colors
-- Custom color support
-- Context menu highlighting
-- Popup control panel
-- Restore highlights automatically
-- Remove highlights individually
-- Clear highlights per page
-- Fast and lightweight architecture
+- **Floating toolbar on selection**: pick a study color (key idea, info, review, question, important…), add a comment, create a note or copy, without opening the popup
+- **Click a highlight** to recolor it, write a comment or review question, mark it as favorite, copy or delete it
+- Highlights that span several paragraphs, lists or inline formatting without breaking the page layout
+- Robust restoring: text + context matching that survives whitespace changes, repeated phrases and late-loading (SPA) content
+- Post-it notes on the page (drag, resize, colors, reading mode to hide them)
+- **Library page**: every highlight and note from every page, global search, filters by color/tag/favorites, inline comment and tag editing, "open at highlight" links
+- **Review mode**: highlights become flashcards (comment = question, or fill-the-gap with the surrounding context) with spaced repetition (1, 3, 7, 14, 30 days)
+- Markdown / TXT / JSON export and full JSON backup/restore
+- PDF support through a built-in PDF.js viewer
+- Side panel, context menu and keyboard shortcuts (Alt+H, Alt+N, Alt+Q)
 
 ---
 
@@ -93,3 +94,25 @@ Unlike temporary browser highlights, this extension **stores highlights locally 
 # Architecture
 
 The project is structured with modular components to separate responsibilities clearly.
+The runtime code is the plain JavaScript in `src/*.js` (loaded directly by the manifest, no build step).
+
+| File | Responsibility |
+|------|----------------|
+| `src/types.js` | Shared namespace, constants, colors, URL/text helpers, Markdown export, spaced-repetition helpers |
+| `src/storage.js` | `chrome.storage.local` access with a write queue so concurrent saves never overwrite each other |
+| `src/highlighter.js` | Text map of the page, highlight anchoring (text + prefix/suffix + position), per-text-node `<mark>` rendering, restore and sync |
+| `src/toolbar.js` | Selection toolbar and highlight popover (Shadow DOM, isolated from page CSS) |
+| `src/notes.js` | Floating post-it notes |
+| `src/focus.js` | Floating study timer |
+| `src/content.js` | Content-script entry point: message handlers, storage sync, SPA URL changes |
+| `src/sidebar.js` | In-page side panel |
+| `src/popup.*` | Extension popup |
+| `src/library.*` | Library and review page (also the extension options page) |
+| `src/pdf-viewer.*` | PDF.js based viewer so PDFs can be annotated |
+| `src/background.js` | Context menus, keyboard commands, PDF redirection |
+
+## Loading the extension
+
+1. Open `chrome://extensions` and enable **Developer mode**.
+2. Click **Load unpacked** and select this folder.
+3. To annotate local PDF files, enable **Allow access to file URLs** in the extension details.

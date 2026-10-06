@@ -1200,3 +1200,81 @@ textarea:focus-visible {
     max-width: 396px;
   }
 }
+
+/* ── Añadidos v2.1 ─────────────────────────────────────────── */
+.app-header__controls .toolbar-btn {
+  min-width: 0;
+  padding: 0 9px;
+}
+
+.toolbar-btn--strong {
+  background: var(--popup-accent);
+  border-color: var(--popup-accent);
+  color: var(--popup-bg);
+}
+
+.toolbar-btn--strong:hover {
+  background: var(--popup-accent-hover);
+}
+
+.setting-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 2px;
+  cursor: pointer;
+}
+
+.setting-toggle + .setting-toggle {
+  border-top: 1px solid var(--popup-border);
+}
+
+.setting-toggle input {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--popup-accent);
+  flex-shrink: 0;
+}
+
+.setting-toggle span {
+  display: grid;
+  gap: 2px;
+}
+
+.setting-toggle small {
+  color: var(--popup-text-soft);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.hl-row__text--link {
+  cursor: pointer;
+}
+
+.hl-row__text--link:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--popup-border-strong);
+  text-underline-offset: 3px;
+}
+
+.hl-row__missing {
+  color: #b45309;
+  font-weight: 600;
+}
+
+.toolbar-btn--icon {
+  width: 34px;
+  padding: 0 !important;
+  font-size: 15px;
+}
+
+.app-header {
+  padding: 16px 14px 12px;
+  align-items: center;
+}
+
+.app-header__controls {
+  flex-wrap: nowrap;
+  gap: 4px;
+}

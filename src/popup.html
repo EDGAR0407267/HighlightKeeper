@@ -18,11 +18,14 @@
     </div>
 
     <div class="app-header__controls">
+      <button id="btn-library" class="toolbar-btn toolbar-btn--strong" type="button" title="Todos tus apuntes, búsqueda global y repaso">
+        Biblioteca
+      </button>
       <button id="btn-sidebar" class="toolbar-btn" type="button" title="Abrir panel lateral">
         Panel
       </button>
-      <button id="btn-dark-mode" class="toolbar-btn" type="button" title="Cambiar tema" aria-pressed="false">
-        Tema
+      <button id="btn-dark-mode" class="toolbar-btn toolbar-btn--icon" type="button" title="Cambiar tema" aria-label="Cambiar tema" aria-pressed="false">
+        ◐
       </button>
       <button id="btn-reading-mode" class="toolbar-btn" type="button" title="Alternar visibilidad de notas" aria-pressed="false">
         Lectura
@@ -329,11 +332,38 @@
         </div>
 
         <ul class="shortcut-list">
+          <li><kbd>Seleccionar</kbd> Barra flotante con colores, comentario y nota</li>
+          <li><kbd>Clic</kbd> en un resaltado: color, comentario, copiar o eliminar</li>
           <li><kbd>Alt+H</kbd> Resaltar seleccion</li>
           <li><kbd>Alt+N</kbd> Crear nota</li>
           <li><kbd>Alt+Q</kbd> Nota desde seleccion</li>
           <li><kbd>Alt+Click</kbd> Eliminar resaltado</li>
         </ul>
+        <button id="btn-shortcuts" class="ghost-btn ghost-btn--full" type="button">Cambiar atajos de teclado</button>
+      </div>
+
+      <div class="section-card section-card--soft">
+        <div class="section-card__header">
+          <div>
+            <p class="section-label">Comportamiento</p>
+            <p class="section-help">Ajusta como se integra la extension en las paginas.</p>
+          </div>
+        </div>
+
+        <label class="setting-toggle">
+          <input id="set-selection-toolbar" type="checkbox" />
+          <span>
+            <strong>Barra al seleccionar texto</strong>
+            <small>Muestra los colores y acciones nada mas seleccionar.</small>
+          </span>
+        </label>
+        <label class="setting-toggle">
+          <input id="set-pdf-viewer" type="checkbox" />
+          <span>
+            <strong>Abrir PDFs en el visor de Annotate</strong>
+            <small>Necesario para resaltar PDFs. Para PDFs locales activa "Permitir acceso a URLs de archivo" en chrome://extensions.</small>
+          </span>
+        </label>
       </div>
 
       <div class="section-card section-card--soft">

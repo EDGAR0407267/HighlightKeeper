@@ -156,82 +156,6 @@
         <div id="ann-sb-org-list" class="ann-sb__list"></div>
       </div>
 
-      <!-- ════ PANEL: STUDY ════ -->
-      <div id="sb-study" class="ann-sb__panel" role="tabpanel" hidden>
-        <div class="ann-sb__study-cfg" id="ann-sb-study-cfg">
-          <p class="ann-sb__study-title">Modo estudio — Flashcards</p>
-
-          <div class="ann-sb__field">
-            <label class="ann-sb__field-label" for="ann-sb-fc-color">Filtrar por color</label>
-            <select id="ann-sb-fc-color" class="ann-sb__select">
-              <option value="all">Todos los colores</option>
-              <option value="green">Idea clave</option>
-              <option value="blue">Info</option>
-              <option value="purple">Duda</option>
-              <option value="orange">Repasar</option>
-              <option value="red">Importante</option>
-              <option value="yellow">Amarillo</option>
-            </select>
-          </div>
-
-          <div class="ann-sb__field">
-            <label class="ann-sb__field-label" for="ann-sb-fc-mode">Modo de repaso</label>
-            <select id="ann-sb-fc-mode" class="ann-sb__select">
-              <option value="recall">Recordar — texto oculto</option>
-              <option value="qa">Pregunta / Respuesta — usa el comentario</option>
-            </select>
-          </div>
-
-          <button class="ann-sb__start-btn" id="ann-sb-start-fc">
-            ${SVG.play} Empezar sesión
-          </button>
-          <p class="ann-sb__fc-status" id="ann-sb-fc-status"></p>
-
-          <div class="ann-sb__study-hint">
-            <strong>Consejo:</strong> Marca con color <em>Duda</em> los conceptos difíciles.
-            Si añades un comentario al resaltado, puedes usarlo como pregunta en el
-            modo Pregunta / Respuesta.
-          </div>
-        </div>
-
-        <!-- Active session -->
-        <div id="ann-sb-fc-session" class="ann-sb__fc-session" hidden>
-          <div class="ann-sb__fc-progress">
-            <span class="ann-sb__fc-counter" id="ann-sb-fc-counter">1 / 1</span>
-            <div class="ann-sb__fc-track">
-              <div class="ann-sb__fc-fill" id="ann-sb-fc-fill" style="width:0%"></div>
-            </div>
-          </div>
-
-          <div class="ann-sb__fc-card ann-sb__fc-card--anim" id="ann-sb-fc-card">
-            <div class="ann-sb__fc-card-face" id="ann-sb-fc-front">
-              <span class="ann-sb__fc-face-label" id="ann-sb-fc-front-label">Fragmento</span>
-              <p class="ann-sb__fc-face-text" id="ann-sb-fc-front-text"></p>
-            </div>
-            <div class="ann-sb__fc-divider" id="ann-sb-fc-divider" hidden></div>
-            <div class="ann-sb__fc-card-face" id="ann-sb-fc-back" hidden>
-              <span class="ann-sb__fc-face-label">Respuesta completa</span>
-              <p class="ann-sb__fc-face-text" id="ann-sb-fc-back-text"></p>
-            </div>
-            <div class="ann-sb__fc-card-footer">
-              <span class="ann-sb__fc-answer-label" id="ann-sb-fc-answer-label">Respuesta oculta</span>
-              <button class="ann-sb__fc-reveal-btn" id="ann-sb-fc-reveal">
-                ${SVG.eye} Revelar
-              </button>
-            </div>
-          </div>
-
-          <div class="ann-sb__fc-controls">
-            <button class="ann-sb__fc-ctrl" id="ann-sb-fc-prev">${SVG.prev} Anterior</button>
-            <button class="ann-sb__fc-ctrl ann-sb__fc-ctrl--primary" id="ann-sb-fc-flip">
-              ${SVG.flip} Siguiente
-            </button>
-            <button class="ann-sb__fc-ctrl" id="ann-sb-fc-next">Siguiente ${SVG.next}</button>
-          </div>
-          <button class="ann-sb__fc-stop" id="ann-sb-fc-stop">Terminar sesión</button>
-        </div>
-      </div>
-
       <!-- TAG EDITOR OVERLAY -->
       <div id="ann-sb-overlay" class="ann-sb__overlay" hidden>
         <div class="ann-sb__overlay-card">
@@ -497,7 +421,7 @@
       list.innerHTML = _emptyState(
         SVG.highlight,
         query ? "Sin resultados" : (_hlFilter !== "all" ? "Ningún resaltado con este filtro" : "Sin resaltados en esta página"),
-        query ? 'Prueba con otras palabras.' : 'Selecciona texto y usa el atajo Alt+H para empezar.'
+        query ? 'Prueba con otras palabras.' : 'Selecciona texto y elige un color en la barra que aparece (o pulsa Alt+H).'
       );
       return;
     }
@@ -524,9 +448,10 @@
           (record.comment ? '<p class="ann-sb__row-comment">' + esc(trunc(record.comment, 120)) + '</p>' : '') +
           (tagsHtml ? '<div class="ann-sb__row-tags">' + tagsHtml + '</div>' : '') +
           '<div class="ann-sb__row-meta">' +
-            '<span class="ann-sb__row-label">' + esc(COLOR_LABELS[record.color]||record.color) + '</span>' +
+            '<span class="ann-sb__row-label">' + esc(COLOR_LABELS[record.color]||ns.getColorLabel(record.color)) + '</span>' +
             '<span class="ann-sb__row-dot"></span>' +
             '<span class="ann-sb__row-date">' + esc(fmtDate(record.createdAt)) + '</span>' +
+            (_isUnresolved(record.id) ? '<span class="ann-sb__row-dot"></span><span class="ann-sb__row-missing" title="El texto ya no aparece igual en la página">No localizado</span>' : '') +
           '</div>' +
         '</div>' +
         '<div class="ann-sb__row-actions">' +
@@ -551,13 +476,8 @@
       row.querySelector('[data-act="del"]').addEventListener("click", async function() {
         row.style.opacity = "0.3";
         row.style.pointerEvents = "none";
-        await getStorage().removeHighlight(ns.getDocumentUrl(), record.id);
-        var mark = document.querySelector('[data-ph-id="' + record.id + '"]');
-        if (mark) {
-          var parent = mark.parentNode;
-          while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
-          parent.removeChild(mark);
-        }
+        if (ns.app && ns.app.renderer) await ns.app.renderer.removeHighlightById(record.id);
+        else await getStorage().removeHighlight(ns.getDocumentUrl(), record.id);
         await loadData();
       });
 
@@ -565,14 +485,12 @@
     });
   }
 
+  function _isUnresolved(id) {
+    return Boolean(ns.app && ns.app.renderer && ns.app.renderer.unresolvedIds.has(id));
+  }
+
   function _scrollTo(id) {
-    var el = document.querySelector('[data-ph-id="' + id + '"]');
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    var prev = el.style.outline;
-    el.style.outline = "3px solid rgba(250,204,21,0.9)";
-    el.style.outlineOffset = "3px";
-    setTimeout(function() { el.style.outline = prev; el.style.outlineOffset = ""; }, 2000);
+    if (ns.app && ns.app.renderer) ns.app.renderer.scrollToHighlight(id);
   }
 
   function _emptyState(svgStr, title, sub) {
@@ -605,6 +523,15 @@
           (n.text ? '<p class="ann-sb__note-text">' + esc(trunc(n.text, 160)) + '</p>' : '') +
           '<p class="ann-sb__note-date">' + esc(fmtDate(n.createdAt)) + '</p>' +
         '</div>';
+      row.style.cursor = "pointer";
+      row.title = "Ir a la nota";
+      row.addEventListener("click", function() {
+        var board = ns.app && ns.app.notesBoard;
+        var noteEl = board && board.noteElements.get(n.id);
+        if (!noteEl) return;
+        if (board.hidden) board._leaveReadingMode();
+        noteEl.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
       list.appendChild(row);
     });
   }
@@ -930,132 +857,6 @@
   }
 
   // ═══════════════════════════════════════════════════════════
-  // FLASHCARDS
-  // ═══════════════════════════════════════════════════════════
-
-  var _fcCards   = [];
-  var _fcIdx     = 0;
-  var _fcRevealed = false;
-
-  function _initFlashcards() {
-    _q("ann-sb-start-fc").addEventListener("click", async function() {
-      var colorFilter = _q("ann-sb-fc-color").value;
-      var mode        = _q("ann-sb-fc-mode").value;
-      var hl = await getStorage().getHighlights(ns.getDocumentUrl());
-
-      if (colorFilter !== "all") hl = hl.filter(function(h) { return h.color === colorFilter; });
-      if (mode === "qa") {
-        var withComment = hl.filter(function(h) { return h.comment && h.comment.trim(); });
-        if (withComment.length) hl = withComment;
-      }
-
-      if (!hl.length) {
-        var st = _q("ann-sb-fc-status");
-        if (st) { st.textContent = "Sin resaltados con ese filtro."; setTimeout(function() { st.textContent=""; }, 2500); }
-        return;
-      }
-
-      _fcCards    = hl.slice().sort(function() { return Math.random()-0.5; });
-      _fcIdx      = 0;
-      _fcRevealed = false;
-      _q("ann-sb-study-cfg").hidden = true;
-      _q("ann-sb-fc-session").hidden = false;
-      _renderCard();
-    });
-
-    _q("ann-sb-fc-stop").addEventListener("click", function() {
-      _q("ann-sb-fc-session").hidden = true;
-      _q("ann-sb-study-cfg").hidden  = false;
-    });
-
-    _q("ann-sb-fc-reveal").addEventListener("click", _revealCard);
-
-    _q("ann-sb-fc-flip").addEventListener("click", function() {
-      if (!_fcRevealed) {
-        _revealCard();
-      } else {
-        if (_fcIdx < _fcCards.length - 1) { _fcIdx++; _renderCard(); }
-        else {
-          // End of deck
-          _q("ann-sb-fc-session").hidden = true;
-          _q("ann-sb-study-cfg").hidden  = false;
-        }
-      }
-    });
-
-    _q("ann-sb-fc-next").addEventListener("click", function() {
-      if (_fcIdx < _fcCards.length-1) { _fcIdx++; _renderCard(); }
-    });
-    _q("ann-sb-fc-prev").addEventListener("click", function() {
-      if (_fcIdx > 0) { _fcIdx--; _renderCard(); }
-    });
-
-    // Keyboard
-    document.addEventListener("keydown", function(e) {
-      if (!isOpen) return;
-      var sess = _q("ann-sb-fc-session");
-      if (!sess || sess.hidden) return;
-      if (e.key === " " || e.key === "f") { e.preventDefault(); _q("ann-sb-fc-flip").click(); }
-      if (e.key === "ArrowRight") { e.preventDefault(); _q("ann-sb-fc-next").click(); }
-      if (e.key === "ArrowLeft")  { e.preventDefault(); _q("ann-sb-fc-prev").click(); }
-    });
-  }
-
-  function _renderCard() {
-    if (!_fcCards.length) return;
-    _fcRevealed = false;
-
-    var card  = _fcCards[_fcIdx];
-    var mode  = _q("ann-sb-fc-mode").value;
-    var total = _fcCards.length;
-    var pct   = (100 * (_fcIdx+1) / total).toFixed(1);
-
-    _q("ann-sb-fc-counter").textContent = (_fcIdx+1) + " / " + total;
-    _q("ann-sb-fc-fill").style.width    = pct + "%";
-
-    var colorLabel = (ns.COLOR_OPTIONS.find(function(c) { return c.id === card.color; })||{}).label || card.color;
-
-    if (mode === "qa" && card.comment && card.comment.trim()) {
-      _q("ann-sb-fc-front-label").textContent = "Contexto / Pregunta";
-      _q("ann-sb-fc-front-text").textContent  = card.comment.trim();
-      _q("ann-sb-fc-back-text").textContent   = card.selectedText;
-    } else {
-      _q("ann-sb-fc-front-label").textContent = colorLabel + " — ¿Recuerdas este fragmento?";
-      _q("ann-sb-fc-front-text").textContent  = trunc(card.selectedText, 60).replace(/\S+/g, "████");
-      _q("ann-sb-fc-back-text").textContent   = card.selectedText;
-    }
-
-    // Reset reveal state
-    _q("ann-sb-fc-back").hidden    = true;
-    _q("ann-sb-fc-divider").hidden = true;
-    _q("ann-sb-fc-answer-label").textContent = "Respuesta oculta";
-    _q("ann-sb-fc-reveal").innerHTML = SVG.eye + " Revelar";
-    _q("ann-sb-fc-flip").innerHTML   = SVG.flip + " Revelar y continuar";
-
-    // Update next/prev state
-    _q("ann-sb-fc-prev").disabled = (_fcIdx === 0);
-    _q("ann-sb-fc-next").disabled = (_fcIdx >= _fcCards.length-1);
-
-    // Animate
-    var cardEl = _q("ann-sb-fc-card");
-    cardEl.classList.remove("ann-sb__fc-card--anim");
-    void cardEl.offsetWidth;
-    cardEl.classList.add("ann-sb__fc-card--anim");
-  }
-
-  function _revealCard() {
-    _fcRevealed = true;
-    _q("ann-sb-fc-back").hidden    = false;
-    _q("ann-sb-fc-divider").hidden = false;
-    _q("ann-sb-fc-answer-label").textContent = "Respuesta";
-    _q("ann-sb-fc-reveal").innerHTML = SVG.check + " Mostrado";
-    _q("ann-sb-fc-reveal").disabled = true;
-    _q("ann-sb-fc-flip").innerHTML   = _fcIdx < _fcCards.length-1
-      ? (SVG.next + " Siguiente carta")
-      : (SVG.check + " Terminar sesion");
-  }
-
-  // ═══════════════════════════════════════════════════════════
   // OPEN / CLOSE
   // ═══════════════════════════════════════════════════════════
 
@@ -1064,12 +865,14 @@
     sidebarEl.classList.remove("ann-sidebar--closed");
     isOpen = true;
     loadData();
+    void updateFab();
   }
 
   function closeSidebar() {
     if (sidebarEl) sidebarEl.classList.add("ann-sidebar--closed");
     isOpen = false;
     _closeDropdown();
+    void updateFab();
   }
 
   function toggleSidebar() {
@@ -1077,28 +880,68 @@
   }
 
   // ── FAB ───────────────────────────────────────────────────────────────────
+  // Solo aparece en páginas que ya tienen anotaciones (o con el panel abierto),
+  // para no ensuciar todas las webs.
   function buildFab() {
-    if (document.getElementById("ann-fab")) return;
+    var existing = document.getElementById("ann-fab");
+    if (existing) return existing;
     var fab = document.createElement("button");
     fab.id        = "ann-fab";
     fab.className = "ann-fab";
+    fab.type      = "button";
     fab.title     = "Annotate — Abrir panel";
     fab.textContent = "AN";
+    fab.setAttribute(ns.UI_ATTR, "fab");
+    fab.style.display = "none";
     fab.addEventListener("click", toggleSidebar);
     document.documentElement.appendChild(fab);
+    return fab;
+  }
+
+  async function updateFab() {
+    var fab = buildFab();
+    var s = getStorage();
+    var url = ns.getDocumentUrl();
+    var total = 0;
+    try {
+      total = (await s.getHighlights(url)).length + (await s.getNotes(url)).length;
+    } catch (_e) {}
+    fab.style.display = (total > 0 || isOpen) ? "" : "none";
+    fab.title = total ? ("Annotate — " + total + " anotaciones en esta página") : "Annotate — Abrir panel";
   }
 
   // ── Messages ───────────────────────────────────────────────────────────────
-  chrome.runtime.onMessage.addListener(function(msg) {
-    if (msg.type === "TOGGLE_SIDEBAR")  toggleSidebar();
-    if (msg.type === "OPEN_SIDEBAR")    openSidebar();
-    if (msg.type === "CLOSE_SIDEBAR")   closeSidebar();
-    if (msg.type === "REFRESH_SIDEBAR" && isOpen) loadData();
+  var SIDEBAR_MESSAGES = {
+    TOGGLE_SIDEBAR:  toggleSidebar,
+    OPEN_SIDEBAR:    openSidebar,
+    CLOSE_SIDEBAR:   closeSidebar,
+    REFRESH_SIDEBAR: function() { if (isOpen) loadData(); }
+  };
+
+  chrome.runtime.onMessage.addListener(function(msg, _sender, sendResponse) {
+    var fn = msg && SIDEBAR_MESSAGES[msg.type];
+    if (!fn) return false;
+    fn();
+    sendResponse({ ok: true, data: { isOpen: isOpen } });
+    return false;
   });
 
-  chrome.storage.onChanged.addListener(function() {
+  var lastUrl = ns.getDocumentUrl();
+  chrome.storage.onChanged.addListener(function(changes, area) {
+    if (area !== "local") return;
+    if (!changes[ns.STORAGE_KEY] && !changes[ns.NOTES_STORAGE_KEY] && !changes[ns.SETTINGS_KEY]) return;
     if (isOpen) loadData();
+    void updateFab();
   });
 
-  buildFab();
+  // Webs SPA: refresca al cambiar de URL
+  setInterval(function() {
+    var next = ns.getDocumentUrl();
+    if (next === lastUrl) return;
+    lastUrl = next;
+    if (isOpen) loadData();
+    void updateFab();
+  }, 1500);
+
+  void updateFab();
 })(globalThis);

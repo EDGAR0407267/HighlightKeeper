@@ -177,6 +177,12 @@ body.annotate-pdf-app {
   background: rgba(245, 158, 11, 0.35);
 }
 
+/* El texto de la capa es transparente: el resaltado se funde con el PDF del canvas */
+.pdf-page__textLayer mark.ph-highlight {
+  mix-blend-mode: multiply;
+  border-radius: 0;
+}
+
 .pdf-page__badge {
   position: absolute;
   top: 18px;

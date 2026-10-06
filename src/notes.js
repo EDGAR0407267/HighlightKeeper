@@ -8,24 +8,42 @@
     this.noteElements    = new Map();
     this.saveTimers      = new Map();
     this.resizeObservers = new Map();
+    this.hidden          = false;
   }
 
   NotesBoard.prototype.createNote = async function (color) {
+    await this._leaveReadingMode();
     this._ensureContainer();
     var note = this._buildNewNote(color);
     this._renderNote(note);
     await this.storage.saveNote(note);
+    var body = this.noteElements.get(note.id) && this.noteElements.get(note.id).querySelector(".ph-note__body");
+    if (body) body.focus({ preventScroll: true });
     return note;
   };
 
   NotesBoard.prototype.createNoteFromText = async function (color, text) {
+    await this._leaveReadingMode();
     this._ensureContainer();
     var note = this._buildNewNote(color);
-    note.text  = text || "";
-    note.title = text ? text.slice(0, 50) : "";
+    var clean = ns.normalizeText(text);
+    note.text  = clean ? "«" + clean + "»\n\n" : "";
+    note.title = clean ? ns.truncate(clean, 50) : "";
     this._renderNote(note);
     await this.storage.saveNote(note);
+    var body = this.noteElements.get(note.id) && this.noteElements.get(note.id).querySelector(".ph-note__body");
+    if (body) {
+      body.focus({ preventScroll: true });
+      body.setSelectionRange(body.value.length, body.value.length);
+    }
     return note;
+  };
+
+  // Crear una nota con el modo lectura activo la dejaría invisible
+  NotesBoard.prototype._leaveReadingMode = async function () {
+    if (!this.hidden) return;
+    this.setHidden(false);
+    try { await this.storage.saveSettings({ readingMode: false }); } catch (_e) {}
   };
 
   NotesBoard.prototype.restoreNotesForCurrentPage = async function () {
@@ -42,15 +60,74 @@
   };
 
   NotesBoard.prototype.observeViewport = function () {
+    var self = this;
+    var timer = 0;
     window.addEventListener("resize", function () {
-      this._syncBounds();
-      this.noteElements.forEach(function (el, id) {
-        var n = this._readFromEl(el, id);
-        var c = this._clamp(n);
-        this._applyLayout(el, c);
-        this._scheduleSave(c);
-      }.bind(this));
-    }.bind(this));
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        self._syncBounds();
+        self.noteElements.forEach(function (el, id) {
+          var n = self._readFromEl(el, id);
+          var c = self._clamp(n);
+          if (c.x === n.x && c.y === n.y && c.width === n.width && c.height === n.height) return;
+          self._applyLayout(el, c);
+          self._scheduleSave(c);
+        });
+      }, 250);
+    });
+  };
+
+  // Modo lectura: oculta (sin borrar) todas las notas de la página
+  NotesBoard.prototype.setHidden = function (hidden) {
+    this.hidden = Boolean(hidden);
+    if (this.container) this.container.style.display = this.hidden ? "none" : "";
+  };
+
+  // Ajusta las notas pintadas al estado guardado (borradas/creadas/editadas fuera)
+  NotesBoard.prototype.syncWithNotes = function (notes) {
+    var self = this;
+    var byId = {};
+    notes.forEach(function (n) { byId[n.id] = n; });
+
+    this.noteElements.forEach(function (el, id) {
+      if (!byId[id]) self._removeEl(id);
+    });
+
+    notes.forEach(function (note) {
+      var el = self.noteElements.get(note.id);
+      if (!el) {
+        self._renderNote(self._normalize(self._clamp(note)));
+        return;
+      }
+      // No pisar lo que el usuario está escribiendo ahora mismo
+      if (el.contains(document.activeElement) || self.saveTimers.get(note.id)) return;
+      var t = el.querySelector(".ph-note__title");
+      var b = el.querySelector(".ph-note__body");
+      if (t && t.value !== (note.title || "")) t.value = note.title || "";
+      if (b && b.value !== (note.text || "")) b.value = note.text || "";
+      if (el.dataset.color !== note.color || (el.dataset.customColor || "") !== (note.customColor || "")) {
+        el.dataset.color = note.color;
+        self._applyColor(el, note);
+      }
+    });
+  };
+
+  // Quita todas las notas del DOM (cambio de página en una SPA)
+  NotesBoard.prototype.reset = function () {
+    var self = this;
+    Array.from(this.noteElements.keys()).forEach(function (id) { self._removeEl(id, true); });
+  };
+
+  NotesBoard.prototype._removeEl = function (id, immediate) {
+    var el = this.noteElements.get(id);
+    window.clearTimeout(this.saveTimers.get(id));
+    this.saveTimers.delete(id);
+    this.noteElements.delete(id);
+    this._disconnectResize(id);
+    if (!el) return;
+    if (immediate) { el.remove(); return; }
+    el.classList.add("ph-note--removing");
+    setTimeout(function () { el.remove(); }, 220);
   };
 
   // Centrada en viewport
@@ -150,12 +227,9 @@
 
     // Eliminar
     el.querySelector('[data-action="delete"]').addEventListener("click", async function () {
-      el.classList.add("ph-note--removing");
-      window.clearTimeout(self.saveTimers.get(note.id));
-      self.saveTimers.delete(note.id);
-      setTimeout(function () { el.remove(); }, 220);
-      self.noteElements.delete(note.id);
-      self._disconnectResize(note.id);
+      var hasContent = (textEl.value || titleEl.value).trim();
+      if (hasContent && !window.confirm("¿Eliminar esta nota? No se puede deshacer.")) return;
+      self._removeEl(note.id);
       await self.storage.removeNote(ns.getDocumentUrl(), note.id);
     });
 
@@ -263,7 +337,6 @@
       height:      Number(el.dataset.height) || 260,
       isMinimized: el.dataset.minimized === "true",
       isFavorite:  el.dataset.favorite  === "true",
-      tags: [],
       createdAt:   el.dataset.createdAt || new Date().toISOString(),
       updatedAt:   new Date().toISOString()
     });
@@ -273,8 +346,12 @@
     var self = this;
     window.clearTimeout(self.saveTimers.get(note.id));
     self.saveTimers.set(note.id, window.setTimeout(function () {
-      self.storage.saveNote(self._clamp(note));
-    }, 200));
+      self.saveTimers.delete(note.id);
+      if (!self.noteElements.has(note.id)) return; // borrada mientras esperaba
+      void self.storage.saveNote(self._clamp(note)).catch(function (err) {
+        console.error("Annotate: no se pudo guardar la nota", err);
+      });
+    }, 250));
   };
 
   NotesBoard.prototype._clamp = function (note) {
@@ -312,24 +389,33 @@
     }
     var div = document.createElement("div");
     div.className = "ph-note-layer";
+    div.setAttribute(ns.UI_ATTR, "notes");
+    if (this.hidden) div.style.display = "none";
     document.documentElement.appendChild(div);
     this.container = div;
     this._syncBounds();
     return div;
   };
 
+  // La capa mide 0×0 y las notas se posicionan desde su esquina. Darle el ancho
+  // de la ventana (que incluye la barra de scroll) creaba scroll horizontal.
   NotesBoard.prototype._syncBounds = function () {
     if (!this.container) return;
-    var w = Math.max(document.documentElement.scrollWidth,  window.innerWidth);
-    var h = Math.max(document.documentElement.scrollHeight, window.innerHeight);
-    this.container.style.width  = w + "px";
-    this.container.style.height = h + "px";
+    this.container.style.width  = "0px";
+    this.container.style.height = "0px";
   };
 
   NotesBoard.prototype._watchResize = function (el, id) {
     if (typeof ResizeObserver === "undefined") return;
     var self = this;
     var obs = new ResizeObserver(function () {
+      if (el.classList.contains("ph-note--minimized") || !el.isConnected) return;
+      var w = Math.round(el.offsetWidth);
+      var h = Math.round(el.offsetHeight);
+      // Solo guarda si el usuario cambió el tamaño (no en el pintado inicial)
+      if (!w || !h || (w === Number(el.dataset.width) && h === Number(el.dataset.height))) return;
+      el.dataset.width  = String(w);
+      el.dataset.height = String(h);
       self._scheduleSave(Object.assign({}, self._readFromEl(el, id), {
         updatedAt: new Date().toISOString()
       }));

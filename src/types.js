@@ -8,6 +8,9 @@
   ns.FOCUS_STORAGE_KEY  = "annotate.focusState";
   ns.HIGHLIGHT_CLASS    = "ph-highlight";
   ns.HIGHLIGHT_ATTR     = "data-ph-id";
+  // Atributo que marca la UI propia (notas, panel, barras). El resaltador la ignora.
+  ns.UI_ATTR            = "data-annotate-ui";
+  ns.UI_SELECTOR        = "[data-annotate-ui], #ann-sidebar, #ann-fab, .ph-note-layer, .ph-focus-overlay";
   ns.DYNAMIC_RESTORE_DELAY_MS = 700;
   ns.DEFAULT_COLOR      = "yellow";
   ns.PDF_VIEWER_PATH    = "src/pdf-viewer.html";
@@ -80,6 +83,38 @@
     { id: "ex-neon-blue",  label: "Neón azul",     hex: "#00d4ff", group: "Neón" },
     { id: "ex-neon-yellow",label: "Neón amarillo", hex: "#ffff00", group: "Neón" }
   ];
+
+  // Hex de los colores base (para UI que no tiene acceso a las clases CSS)
+  ns.COLOR_HEX = {
+    yellow: "#fde047", green: "#4ade80", blue: "#60a5fa", pink: "#f472b6",
+    orange: "#fb923c", purple: "#c084fc", teal: "#2dd4bf", red: "#f87171", gray: "#94a3b8"
+  };
+
+  // Colores que aparecen en la barra flotante de selección (los de estudio)
+  ns.QUICK_COLORS = ["yellow", "green", "blue", "orange", "purple", "red"];
+
+  ns.getColorLabel = function getColorLabel(colorId) {
+    const opt = ns.COLOR_OPTIONS.find(function(o) { return o.id === colorId; });
+    if (opt) return opt.label;
+    return colorId === "custom" ? "Personalizado" : String(colorId || "");
+  };
+
+  ns.getHighlightHex = function getHighlightHex(record) {
+    if (record && record.customColor) return record.customColor;
+    return ns.COLOR_HEX[record && record.color] || ns.COLOR_HEX.yellow;
+  };
+
+  // Traduce el color guardado en ajustes (puede ser "ex-*") a { color, customColor }
+  ns.resolveHighlightColor = function resolveHighlightColor(selectedColor, customColor) {
+    if (selectedColor && String(selectedColor).startsWith("ex-")) {
+      const extra = ns.EXTRA_COLOR_OPTIONS.find(function(o) { return o.id === selectedColor; });
+      return { color: "custom", customColor: extra ? extra.hex : ns.sanitizeColorHex(customColor) };
+    }
+    if (selectedColor === "custom") {
+      return { color: "custom", customColor: ns.sanitizeColorHex(customColor) };
+    }
+    return { color: selectedColor || ns.DEFAULT_COLOR, customColor: undefined };
+  };
 
   // ── Colores de notas ──────────────────────────────────────────────────────
   ns.NOTE_COLOR_OPTIONS = [
@@ -390,5 +425,109 @@
   ns.truncate = function truncate(text, max) {
     const t = String(text || "");
     return t.length <= max ? t : t.slice(0, max) + "…";
+  };
+
+  // ── Enlace que abre la página y hace scroll hasta el texto (Text Fragments) ─
+  ns.buildTextFragmentUrl = function buildTextFragmentUrl(record) {
+    const base = ns.normalizeUrl(record.url);
+    const words = ns.normalizeText(record.selectedText).split(" ");
+    if (!words[0]) return base;
+    const enc = function(s) { return encodeURIComponent(s).replace(/-/g, "%2D"); };
+    let directive;
+    if (words.length <= 8) {
+      directive = enc(words.join(" "));
+    } else {
+      directive = enc(words.slice(0, 4).join(" ")) + "," + enc(words.slice(-4).join(" "));
+    }
+    return base + "#:~:text=" + directive;
+  };
+
+  // ── Exportación a Markdown (agrupada por página, en orden de lectura) ────
+  ns.buildMarkdownExport = function buildMarkdownExport(highlights, notes, heading) {
+    const pages = {};
+    const order = [];
+    function page(url, title) {
+      if (!pages[url]) { pages[url] = { url: url, title: "", highlights: [], notes: [] }; order.push(url); }
+      if (title && !pages[url].title) pages[url].title = title;
+      return pages[url];
+    }
+    (highlights || []).forEach(function(h) { page(h.url, h.pageTitle).highlights.push(h); });
+    (notes || []).forEach(function(n) { page(n.url, n.pageTitle).notes.push(n); });
+
+    const byPos = function(a, b) {
+      const pa = Number.isFinite(a.textPos) ? a.textPos : Infinity;
+      const pb = Number.isFinite(b.textPos) ? b.textPos : Infinity;
+      if (pa !== pb) return pa < pb ? -1 : 1;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    };
+    const oneLine = function(s) { return ns.normalizeText(s); };
+    const multiLine = function(s, indent) {
+      return String(s || "").trim().split(/\r?\n/).join("\n" + indent);
+    };
+
+    let out = heading ? "# " + heading + "\n\n" : "";
+    out += "_Exportado con Annotate el " + new Date().toLocaleString("es-ES") + "_\n\n";
+
+    order.forEach(function(url) {
+      const p = pages[url];
+      out += "## " + (p.title || url) + "\n\n<" + url + ">\n\n";
+      p.highlights.sort(byPos).forEach(function(h) {
+        out += "- **" + ns.getColorLabel(h.color) + ":** " + oneLine(h.selectedText) + "\n";
+        if (h.comment) out += "  - 💬 " + multiLine(h.comment, "    ") + "\n";
+        if (h.tags && h.tags.length) out += "  - " + h.tags.map(function(t) { return "#" + t.replace(/\s+/g, "-"); }).join(" ") + "\n";
+      });
+      if (p.notes.length) {
+        out += (p.highlights.length ? "\n" : "") + "### Notas\n\n";
+        p.notes.forEach(function(n) {
+          out += "#### " + (n.title || "Sin título") + "\n\n" + (String(n.text || "").trim() || "_(vacía)_") + "\n\n";
+        });
+      }
+      out += "\n";
+    });
+    return out.trim() + "\n";
+  };
+
+  ns.downloadText = function downloadText(content, filename, mime) {
+    const blob = new Blob([content], { type: (mime || "text/plain") + ";charset=utf-8" });
+    const a    = document.createElement("a");
+    a.href     = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+  };
+
+  ns.slugify = function slugify(text) {
+    return ns.normalizeText(text).toLowerCase()
+      .normalize("NFD").replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "apuntes";
+  };
+
+  // ── Repaso espaciado (sistema Leitner) ───────────────────────────────────
+  // Caja 0 = nueva. Cada acierto sube de caja; un fallo vuelve a la caja 1.
+  ns.REVIEW_INTERVAL_DAYS = [0, 1, 3, 7, 14, 30];
+
+  ns.isDueForReview = function isDueForReview(record, now) {
+    const review = record && record.review;
+    if (!review || !review.dueAt) return true;
+    return new Date(review.dueAt).getTime() <= (now || Date.now());
+  };
+
+  ns.nextReviewState = function nextReviewState(record, remembered, now) {
+    const current = (record && record.review) || { box: 0, reviews: 0, lapses: 0 };
+    const maxBox  = ns.REVIEW_INTERVAL_DAYS.length - 1;
+    const box     = remembered ? Math.min((current.box || 0) + 1, maxBox) : 1;
+    const days    = remembered ? ns.REVIEW_INTERVAL_DAYS[box] : 0;
+    const base    = now || Date.now();
+    // Un fallo se vuelve a preguntar en 10 minutos
+    const dueAt   = new Date(base + (remembered ? days * 86400000 : 10 * 60000)).toISOString();
+    return {
+      box: box,
+      dueAt: dueAt,
+      lastReviewedAt: new Date(base).toISOString(),
+      reviews: (current.reviews || 0) + 1,
+      lapses: (current.lapses || 0) + (remembered ? 0 : 1)
+    };
   };
 })(globalThis);

@@ -2,300 +2,565 @@
   "use strict";
   var ns = global.PersistentHighlighter;
 
+  // Caracteres de contexto guardados antes/después del texto para reencontrarlo
+  var CONTEXT_CHARS = 64;
+  // Nodos cuyo texto nunca se resalta ni cuenta para las posiciones
+  var SKIP_SELECTOR = "script, style, noscript, textarea, input, select, option, template, svg, math, " + ns.UI_SELECTOR;
+  var WS_RE = /\s/;
+
   // ─────────────────────────────────────────────────────────────────────────
-  // HighlightRenderer
+  // Modelo
+  //   Cada resaltado se describe por su texto normalizado + contexto (prefijo,
+  //   sufijo) + posición aproximada en el texto de la página. Para pintarlo se
+  //   envuelve CADA nodo de texto afectado en su propio <mark>, así una
+  //   selección que cruza párrafos no rompe la maquetación.
   // ─────────────────────────────────────────────────────────────────────────
+
   function HighlightRenderer(storage) {
     this.storage            = storage;
     this.mutationObserver   = null;
     this.restoreTimerId     = 0;
-    this.restoreInFlight    = false;
     this.lastSelectionRange = null;
-    this._tooltip           = null;
-    this._initDeleteTooltip();
+    this.unresolvedIds      = new Set();
+    this._lastScanAt        = 0;
+    this._queue             = Promise.resolve();
   }
 
+  // Serializa las operaciones que tocan el DOM (aplicar, borrar, restaurar)
+  HighlightRenderer.prototype._enqueue = function (task) {
+    var run = this._queue.then(task, task);
+    this._queue = run.catch(function () {});
+    return run;
+  };
+
   // ══════════════════════════════════════════════════════════════════════════
-  // BOTÓN FLOTANTE DE ELIMINAR (hover sobre cualquier resaltado)
+  // MAPA DE TEXTO
   // ══════════════════════════════════════════════════════════════════════════
 
-  HighlightRenderer.prototype._initDeleteTooltip = function () {
-    var self      = this;
-    var btn       = document.createElement("button");
-    btn.className = "ph-delete-tooltip";
-    btn.innerHTML = "<span>✕</span> Eliminar";
-    btn.style.display = "none";
-    document.documentElement.appendChild(btn);
-    this._tooltip = btn;
+  HighlightRenderer.prototype.buildTextMap = function (root) {
+    root = root || document.body;
+    var entries = [];
+    var chunks  = [];
+    var pos     = 0;
+    if (!root) return { text: "", entries: entries, byNode: new Map() };
 
-    var hideTimer   = null;
-    var activeMark  = null;
-
-    function place(mark) {
-      clearTimeout(hideTimer);
-      activeMark = mark;
-      var rect       = mark.getBoundingClientRect();
-      var scrollX    = window.scrollX;
-      var scrollY    = window.scrollY;
-      btn.style.display = "flex";
-      btn.style.top  = (scrollY + rect.top - 34) + "px";
-      btn.style.left = (scrollX + rect.left)      + "px";
-    }
-
-    function schedHide() {
-      hideTimer = setTimeout(function () {
-        btn.style.display = "none";
-        activeMark = null;
-      }, 250);
-    }
-
-    document.addEventListener("mouseover", function (e) {
-      var mark = e.target && e.target.closest
-        ? e.target.closest("." + ns.HIGHLIGHT_CLASS)
-        : null;
-      if (mark) place(mark);
-    });
-
-    document.addEventListener("mouseout", function (e) {
-      var mark = e.target && e.target.closest
-        ? e.target.closest("." + ns.HIGHLIGHT_CLASS)
-        : null;
-      if (mark && e.relatedTarget !== btn && !btn.contains(e.relatedTarget)) {
-        schedHide();
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        if (!node.data) return NodeFilter.FILTER_REJECT;
+        var pe = node.parentElement;
+        if (!pe || pe.closest(SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
       }
     });
 
-    btn.addEventListener("mouseenter", function () { clearTimeout(hideTimer); });
-    btn.addEventListener("mouseleave", schedHide);
+    var byNode = new Map();
+    var cur = walker.nextNode();
+    while (cur) {
+      var entry = { node: cur, start: pos, end: pos + cur.data.length };
+      entries.push(entry);
+      byNode.set(cur, entry);
+      chunks.push(cur.data);
+      pos = entry.end;
+      cur = walker.nextNode();
+    }
+    return { text: chunks.join(""), entries: entries, byNode: byNode };
+  };
 
-    btn.addEventListener("click", function (e) {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!activeMark) return;
-      var id = activeMark.getAttribute(ns.HIGHLIGHT_ATTR);
-      if (!id) return;
-      btn.style.display = "none";
-      activeMark = null;
-      self.removeHighlightById(id);
-    });
+  // Versión con espacios colapsados + tabla para volver a offsets reales
+  function buildNormalized(text) {
+    var out = [];
+    var idx = [];
+    var inSpace = true; // ignora espacios iniciales
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      var code = text.charCodeAt(i);
+      var isSpace = code === 32 || code === 10 || code === 9 || code === 13 || code === 12 ||
+        (code > 127 && WS_RE.test(ch));
+      if (isSpace) {
+        if (!inSpace) { out.push(" "); idx.push(i); }
+        inSpace = true;
+      } else {
+        out.push(ch);
+        idx.push(i);
+        inSpace = false;
+      }
+    }
+    return { text: out.join(""), map: idx };
+  }
+
+  // Busca la entrada (nodo de texto) que contiene el offset global
+  function findEntryIndex(entries, offset) {
+    var lo = 0, hi = entries.length - 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (entries[mid].end <= offset) lo = mid + 1;
+      else if (entries[mid].start > offset) hi = mid - 1;
+      else return mid;
+    }
+    return -1;
+  }
+
+  // Convierte un Range del DOM en offsets globales del mapa
+  HighlightRenderer.prototype._rangeToOffsets = function (range, map) {
+    var start = -1, end = -1;
+    var se = range.startContainer.nodeType === Node.TEXT_NODE ? map.byNode.get(range.startContainer) : null;
+    var ee = range.endContainer.nodeType === Node.TEXT_NODE ? map.byNode.get(range.endContainer) : null;
+
+    if (se) start = se.start + range.startOffset;
+    if (ee) end = ee.start + range.endOffset;
+
+    if (start < 0 || end < 0) {
+      for (var i = 0; i < map.entries.length; i++) {
+        var e = map.entries[i];
+        if (!range.intersectsNode(e.node)) continue;
+        if (start < 0) start = e.start + (e.node === range.startContainer ? range.startOffset : 0);
+        if (!ee) end = e.start + (e.node === range.endContainer ? range.endOffset : e.node.data.length);
+      }
+    }
+    if (start < 0 || end <= start) return null;
+
+    // Recorta espacios en los extremos
+    while (start < end && WS_RE.test(map.text.charAt(start))) start++;
+    while (end > start && WS_RE.test(map.text.charAt(end - 1))) end--;
+    return end > start ? { start: start, end: end } : null;
+  };
+
+  // Intervalos ocupados por los resaltados ya pintados: { id: {start, end} }
+  HighlightRenderer.prototype._collectSpans = function (map) {
+    var spans = {};
+    var HL = "." + ns.HIGHLIGHT_CLASS;
+    for (var i = 0; i < map.entries.length; i++) {
+      var e = map.entries[i];
+      var mark = e.node.parentElement && e.node.parentElement.closest(HL);
+      if (!mark) continue;
+      var id = mark.getAttribute(ns.HIGHLIGHT_ATTR);
+      if (!id) continue;
+      var span = spans[id];
+      if (!span) spans[id] = { start: e.start, end: e.end };
+      else { span.start = Math.min(span.start, e.start); span.end = Math.max(span.end, e.end); }
+    }
+    return spans;
   };
 
   // ══════════════════════════════════════════════════════════════════════════
   // APLICAR RESALTADO
-  //   Escenario A – Texto completamente limpio → nuevo mark
-  //   Escenario B – Selección dentro de UN mark (todo o parte) → recolor/split
-  //   Escenario C – Selección cruza varios marks → unificar con nuevo color
   // ══════════════════════════════════════════════════════════════════════════
 
-  HighlightRenderer.prototype.applySelectionHighlight = async function (color, customColor) {
-    var sel       = window.getSelection();
-    var liveRange = (sel && sel.rangeCount > 0 && !sel.isCollapsed)
-      ? sel.getRangeAt(0).cloneRange() : null;
-    var range     = liveRange || (this.lastSelectionRange ? this.lastSelectionRange.cloneRange() : null);
-    var selText   = ns.normalizeText(range ? range.toString() : "");
+  HighlightRenderer.prototype.applySelectionHighlight = function (color, customColor) {
+    var self = this;
+    return this._enqueue(async function () {
+      var range = self._currentRange();
+      if (!range) throw new Error("Selecciona un texto antes de resaltar.");
 
-    if (!selText) throw new Error("Selecciona un texto antes de resaltar.");
+      var map = self.buildTextMap();
+      var off = self._rangeToOffsets(range, map);
+      if (!off) throw new Error("Selecciona un texto de la página antes de resaltar.");
 
-    var resolvedCustom = color === "custom" ? ns.sanitizeColorHex(customColor) : undefined;
-    if (sel) sel.removeAllRanges();
+      var sel = window.getSelection();
+      if (sel) sel.removeAllRanges();
+      self.lastSelectionRange = null;
 
-    // ── B: la selección cae completamente dentro de UN mark ──────────────
-    var container = range ? this._containingMark(range) : null;
-    if (container) {
-      var cid = container.getAttribute(ns.HIGHLIGHT_ATTR);
-      var recs = await this.storage.getHighlights(ns.getDocumentUrl());
-      var rec  = recs.find(function (r) { return r.id === cid; });
-      if (rec) {
-        // B1: selección == mark completo → solo cambiar color
-        if (this._coversFull(range, container)) {
-          this._setColor(container, color, resolvedCustom);
-          var upd = Object.assign({}, rec, { color: color, customColor: resolvedCustom });
-          await this.storage.saveHighlight(upd);
-          return upd;
-        }
-        // B2: selección parcial → dividir en 2 ó 3 marks
-        return this._splitMark(container, rec, range, color, resolvedCustom);
+      var resolvedCustom = color === "custom" ? ns.sanitizeColorHex(customColor) : undefined;
+      return self._applyOffsets(map, off.start, off.end, color || ns.DEFAULT_COLOR, resolvedCustom);
+    });
+  };
+
+  HighlightRenderer.prototype._applyOffsets = async function (map, s, e, color, custom) {
+    var self  = this;
+    var url   = ns.getDocumentUrl();
+    var spans = this._collectSpans(map);
+    var overlapping = Object.keys(spans).filter(function (id) {
+      return spans[id].start < e && spans[id].end > s;
+    });
+
+    var records = await this.storage.getHighlights(url);
+    var byId = {};
+    records.forEach(function (r) { byId[r.id] = r; });
+
+    // Caso simple: la selección coincide con un resaltado existente → solo recolorear
+    if (overlapping.length === 1) {
+      var only = spans[overlapping[0]];
+      var rec0 = byId[overlapping[0]];
+      if (rec0 && only.start === s && only.end === e) {
+        var recolored = Object.assign({}, rec0, {
+          color: color, customColor: custom, category: categoryFor(color), updatedAt: new Date().toISOString()
+        });
+        this._decorate(recolored);
+        await this.storage.saveHighlight(recolored);
+        return recolored;
       }
     }
 
-    // ── C: selección que cruza varios marks → eliminarlos y crear uno nuevo
-    var overlaps = this._overlappingMarks(range);
-    if (overlaps.length > 0) {
-      return this._mergeAndRecolor(range, overlaps, selText, color, resolvedCustom);
-    }
+    // Caso general: los resaltados solapados se recortan a la parte que queda
+    // fuera de la selección; la selección se convierte en un resaltado nuevo.
+    var removeIds = [];
+    var upserts   = [];
+    var wraps     = [];
+    var inherited = null;
 
-    // ── A: texto limpio → nuevo mark ─────────────────────────────────────
-    var record = this._buildRecord(range, selText, color,
-      ns.getDocumentUrl(), resolvedCustom);
-    this._wrap(range, record);
-    await this.storage.saveHighlight(record);
-    return record;
-  };
+    overlapping.forEach(function (id) {
+      var span = spans[id];
+      var rec  = byId[id];
+      self._unwrapId(id);
+      if (!rec) return;
 
-  // ── Split: divide un mark en hasta 3 partes ───────────────────────────────
-  HighlightRenderer.prototype._splitMark = async function (markEl, orig, selRange, newColor, newCustom) {
-    var url    = ns.getDocumentUrl();
-    var parent = markEl.parentNode;
+      var pieces = [];
+      var before = trimOffsets(map.text, span.start, Math.min(span.end, s));
+      var after  = trimOffsets(map.text, Math.max(span.start, e), span.end);
+      if (span.start < s && before) pieces.push(before);
+      if (span.end > e && after) pieces.push(after);
 
-    // Calcular los tres rangos: antes | selección | después
-    var markRange = document.createRange();
-    markRange.selectNodeContents(markEl);
-
-    var beforeRange = null, afterRange = null;
-
-    // Rango ANTES: desde inicio del mark hasta inicio de la selección
-    if (markRange.startContainer !== selRange.startContainer ||
-        markRange.startOffset    !== selRange.startOffset) {
-      try {
-        beforeRange = document.createRange();
-        beforeRange.setStart(markRange.startContainer, markRange.startOffset);
-        beforeRange.setEnd(selRange.startContainer, selRange.startOffset);
-        if (beforeRange.collapsed || !ns.normalizeText(beforeRange.toString())) {
-          beforeRange = null;
-        }
-      } catch (_e) { beforeRange = null; }
-    }
-
-    // Rango DESPUÉS: desde fin de la selección hasta fin del mark
-    if (markRange.endContainer !== selRange.endContainer ||
-        markRange.endOffset    !== selRange.endOffset) {
-      try {
-        afterRange = document.createRange();
-        afterRange.setStart(selRange.endContainer, selRange.endOffset);
-        afterRange.setEnd(markRange.endContainer, markRange.endOffset);
-        if (afterRange.collapsed || !ns.normalizeText(afterRange.toString())) {
-          afterRange = null;
-        }
-      } catch (_e) { afterRange = null; }
-    }
-
-    // Si no hay ni antes ni después: simplemente recolorear el mark completo
-    if (!beforeRange && !afterRange) {
-      this._setColor(markEl, newColor, newCustom);
-      var u = Object.assign({}, orig, { color: newColor, customColor: newCustom });
-      await this.storage.saveHighlight(u);
-      return u;
-    }
-
-    // Extraer fragmentos en orden inverso para no invalidar los rangos
-    var afterFrag  = afterRange  ? afterRange.extractContents()  : null;
-    var midFrag    = selRange.extractContents();
-    var beforeFrag = beforeRange ? beforeRange.extractContents() : null;
-
-    // markEl ahora está vacío; usar como ancla de inserción
-    var anchor = markEl;
-
-    // Construir los nuevos marks en orden (antes → medio → después)
-    var inserts  = [];
-    var newRecs  = [];
-
-    if (beforeFrag && ns.normalizeText(beforeFrag.textContent)) {
-      var bRec  = this._cloneRec(orig, ns.normalizeText(beforeFrag.textContent));
-      var bMark = this._makeMarkEl(bRec);
-      bMark.appendChild(beforeFrag);
-      inserts.push(bMark); newRecs.push(bRec);
-    }
-
-    var mRec  = this._cloneRec(orig, ns.normalizeText(midFrag.textContent), newColor, newCustom);
-    mRec.createdAt = new Date().toISOString();
-    var mMark = this._makeMarkEl(mRec);
-    mMark.appendChild(midFrag);
-    inserts.push(mMark); newRecs.push(mRec);
-
-    if (afterFrag && ns.normalizeText(afterFrag.textContent)) {
-      var aRec  = this._cloneRec(orig, ns.normalizeText(afterFrag.textContent));
-      var aMark = this._makeMarkEl(aRec);
-      aMark.appendChild(afterFrag);
-      inserts.push(aMark); newRecs.push(aRec);
-    }
-
-    // Insertar antes del anchor (mark original vacío)
-    for (var i = 0; i < inserts.length; i++) {
-      parent.insertBefore(inserts[i], anchor);
-    }
-    // Eliminar el mark original vacío
-    if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
-    parent.normalize();
-
-    // Actualizar storage
-    await this.storage.removeHighlight(url, orig.id);
-    for (var j = 0; j < newRecs.length; j++) {
-      await this.storage.saveHighlight(newRecs[j]);
-    }
-
-    return mRec; // devolver el fragmento nuevo resaltado
-  };
-
-  // ── Merge: elimina marks solapados y crea uno nuevo ──────────────────────
-  HighlightRenderer.prototype._mergeAndRecolor = async function (range, marks, selText, color, custom) {
-    var url = ns.getDocumentUrl();
-    for (var i = 0; i < marks.length; i++) {
-      var id = marks[i].getAttribute(ns.HIGHLIGHT_ATTR);
-      if (id) {
-        this._unwrap(marks[i]);
-        await this.storage.removeHighlight(url, id);
+      if (!pieces.length) {
+        removeIds.push(id);
+        if (!inherited && (rec.comment || (rec.tags && rec.tags.length) || rec.isFavorite)) inherited = rec;
+        return;
       }
+      pieces.forEach(function (p, k) {
+        var piece = Object.assign({}, rec, self._describe(map, p.start, p.end), {
+          id: k === 0 ? rec.id : ns.createId(),
+          updatedAt: new Date().toISOString()
+        });
+        upserts.push(piece);
+        wraps.push({ start: p.start, end: p.end, record: piece });
+      });
+    });
+
+    var newRec = this._buildRecord(map, s, e, color, custom);
+    if (inherited) {
+      newRec.comment    = inherited.comment || "";
+      newRec.tags       = (inherited.tags || []).slice();
+      newRec.isFavorite = Boolean(inherited.isFavorite);
+      newRec.review     = inherited.review;
     }
-    var rec = this._buildRecord(range, selText, color, url, custom);
-    try { this._wrap(range, rec); }
-    catch (_e) {
-      var r2 = this.findRangeForRecord(rec);
-      if (r2) this._wrap(r2, rec);
-    }
-    await this.storage.saveHighlight(rec);
-    return rec;
+    upserts.push(newRec);
+    wraps.push({ start: s, end: e, record: newRec });
+
+    // De atrás hacia delante: dividir nodos posteriores no invalida los anteriores
+    wraps.sort(function (a, b) { return b.start - a.start; });
+    wraps.forEach(function (w) { self._wrapOffsets(map, w.start, w.end, w.record); });
+    this._discardOwnMutations();
+
+    await this.storage.replaceHighlights(url, removeIds, upserts);
+    return newRec;
   };
 
+  function trimOffsets(text, start, end) {
+    while (start < end && WS_RE.test(text.charAt(start))) start++;
+    while (end > start && WS_RE.test(text.charAt(end - 1))) end--;
+    return end > start ? { start: start, end: end } : null;
+  }
+
+  function categoryFor(color) {
+    return (ns.COLOR_OPTIONS.find(function (o) { return o.id === color; }) || {}).category || "general";
+  }
+
+  HighlightRenderer.prototype._describe = function (map, s, e) {
+    var raw = map.text.slice(s, e);
+    return {
+      selectedText: ns.normalizeText(raw),
+      prefix:       ns.normalizeText(map.text.slice(Math.max(0, s - CONTEXT_CHARS), s)),
+      suffix:       ns.normalizeText(map.text.slice(e, e + CONTEXT_CHARS)),
+      textPos:      s,
+      docLength:    map.text.length
+    };
+  };
+
+  HighlightRenderer.prototype._buildRecord = function (map, s, e, color, custom) {
+    var ts = new Date().toISOString();
+    var d  = this._describe(map, s, e);
+    return Object.assign(d, {
+      id:          ns.createId(),
+      url:         ns.getDocumentUrl(),
+      pageTitle:   getPageTitle(),
+      color:       color,
+      customColor: custom,
+      category:    categoryFor(color),
+      createdAt:   ts,
+      updatedAt:   ts,
+      comment:     "",
+      tags:        [],
+      isFavorite:  false
+    });
+  };
+
+  function getPageTitle() {
+    var t = ns.normalizeText(document.title || "");
+    if (global.__annotatePdfMode) {
+      t = t.replace(/\s*·\s*Annotate PDF$/, "");
+    }
+    return t;
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
-  // RECORDAR SELECCIÓN
+  // PINTAR / DESPINTAR
   // ══════════════════════════════════════════════════════════════════════════
 
-  HighlightRenderer.prototype.rememberCurrentSelection = function () {
-    var sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-    var r = sel.getRangeAt(0).cloneRange();
-    if (!ns.normalizeText(r.toString())) return;
-    this.lastSelectionRange = r;
+  HighlightRenderer.prototype._wrapOffsets = function (map, start, end, record) {
+    var segs = [];
+    var i = findEntryIndex(map.entries, start);
+    if (i < 0) return 0;
+    for (; i < map.entries.length; i++) {
+      var en = map.entries[i];
+      if (en.start >= end) break;
+      var a = Math.max(start, en.start) - en.start;
+      var b = Math.min(end, en.end) - en.start;
+      if (b > a) segs.push({ node: en.node, a: a, b: b });
+    }
+
+    var count = 0;
+    for (var k = segs.length - 1; k >= 0; k--) {
+      var seg  = segs[k];
+      var node = seg.node;
+      if (!node.parentNode || seg.b > node.data.length) continue;
+      if (!node.data.slice(seg.a, seg.b).trim()) continue; // solo espacios: no se envuelve
+      if (seg.b < node.data.length) node.splitText(seg.b);
+      var target = seg.a > 0 ? node.splitText(seg.a) : node;
+      var mark = this._makeMarkEl(record);
+      target.parentNode.insertBefore(mark, target);
+      mark.appendChild(target);
+      count++;
+    }
+    if (count) this._decorate(record);
+    return count;
+  };
+
+  HighlightRenderer.prototype._makeMarkEl = function (rec) {
+    var m = document.createElement("mark");
+    m.className = ns.HIGHLIGHT_CLASS;
+    m.setAttribute(ns.HIGHLIGHT_ATTR, rec.id);
+    return m;
+  };
+
+  // Aplica color, comentario y marcas de inicio/fin a todos los segmentos
+  HighlightRenderer.prototype._decorate = function (rec) {
+    var marks = this.getHighlightElements(rec.id);
+    if (!marks.length) return;
+    var colorClasses = ns.COLOR_OPTIONS.map(function (o) { return ns.HIGHLIGHT_CLASS + "--" + o.id; });
+    colorClasses.push(ns.HIGHLIGHT_CLASS + "--custom");
+    var hasComment = Boolean(rec.comment && rec.comment.trim());
+
+    marks.forEach(function (m, idx) {
+      m.classList.remove.apply(m.classList, colorClasses);
+      m.classList.add(ns.HIGHLIGHT_CLASS + "--" + (rec.color || ns.DEFAULT_COLOR));
+      m.setAttribute("data-ph-color", rec.color || ns.DEFAULT_COLOR);
+      if (rec.customColor) m.style.setProperty("--ph-custom-highlight", rec.customColor);
+      else m.style.removeProperty("--ph-custom-highlight");
+      m.classList.toggle("ph-highlight--has-comment", hasComment && idx === marks.length - 1);
+      if (hasComment) m.title = rec.comment;
+      else m.removeAttribute("title");
+    });
+  };
+
+  HighlightRenderer.prototype._unwrapId = function (id) {
+    var marks = this.getHighlightElements(id);
+    marks.forEach(function (el) {
+      var p = el.parentNode;
+      if (!p) return;
+      while (el.firstChild) p.insertBefore(el.firstChild, el);
+      p.removeChild(el);
+    });
+    return marks.length;
   };
 
   // ══════════════════════════════════════════════════════════════════════════
   // RESTAURAR
   // ══════════════════════════════════════════════════════════════════════════
 
-  HighlightRenderer.prototype.restoreHighlightsForCurrentPage = async function () {
-    var records = await this.storage.getHighlights(ns.getDocumentUrl());
-    var count   = 0;
-    for (var i = 0; i < records.length; i++) {
-      var rec = records[i];
-      if (this.findHighlightElement(rec.id)) continue;
-      var range = this.findRangeForRecord(rec);
-      if (!range || range.collapsed) continue;
-      try { this._wrap(range, rec); count++; } catch (_e) {}
-    }
+  HighlightRenderer.prototype.restoreHighlightsForCurrentPage = function () {
+    var self = this;
+    return this._enqueue(async function () {
+      var records = await self.storage.getHighlights(ns.getDocumentUrl());
+      return self._restoreRecords(records);
+    });
+  };
+
+  HighlightRenderer.prototype._restoreRecords = function (records) {
+    var self = this;
+    var missing = records.filter(function (r) { return r.selectedText && !self.findHighlightElement(r.id); });
+    // Mantiene al día color/comentario de los que ya están pintados
+    records.forEach(function (r) { if (self.findHighlightElement(r.id)) self._decorate(r); });
+    if (!missing.length) return 0;
+
+    var map = this.buildTextMap();
+    if (!map.text) return 0;
+    var norm = buildNormalized(map.text);
+
+    var spans = this._collectSpans(map);
+    var occupied = Object.keys(spans).map(function (id) { return spans[id]; });
+    var targets = [];
+
+    missing.forEach(function (rec) {
+      var off = locate(rec, map, norm, occupied);
+      if (!off) { self.unresolvedIds.add(rec.id); return; }
+      self.unresolvedIds.delete(rec.id);
+      occupied.push(off);
+      targets.push({ start: off.start, end: off.end, record: rec });
+    });
+
+    targets.sort(function (a, b) { return b.start - a.start; });
+    var count = 0;
+    targets.forEach(function (t) {
+      try { if (self._wrapOffsets(map, t.start, t.end, t.record)) count++; } catch (_e) {}
+    });
+    this._discardOwnMutations();
     return count;
   };
 
+  function overlapsAny(list, s, e) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].start < e && list[i].end > s) return true;
+    }
+    return false;
+  }
+
+  function commonSuffixLength(a, b) {
+    var n = 0;
+    while (n < a.length && n < b.length && a.charAt(a.length - 1 - n) === b.charAt(b.length - 1 - n)) n++;
+    return n;
+  }
+
+  function commonPrefixLength(a, b) {
+    var n = 0;
+    while (n < a.length && n < b.length && a.charAt(n) === b.charAt(n)) n++;
+    return n;
+  }
+
+  // Encuentra la mejor aparición del texto del registro en la página
+  function locate(rec, map, norm, occupied) {
+    var needle = ns.normalizeText(rec.selectedText);
+    if (!needle) return null;
+    var haystack = norm.text;
+
+    var candidates = [];
+    var from = 0;
+    while (candidates.length < 500) {
+      var i = haystack.indexOf(needle, from);
+      if (i === -1) break;
+      candidates.push(i);
+      from = i + 1;
+    }
+    // Último recurso: sin distinguir mayúsculas (p. ej. CSS text-transform)
+    if (!candidates.length) {
+      var lowerHay = haystack.toLowerCase();
+      var lowerNeedle = needle.toLowerCase();
+      from = 0;
+      while (candidates.length < 500) {
+        var j = lowerHay.indexOf(lowerNeedle, from);
+        if (j === -1) break;
+        candidates.push(j);
+        from = j + 1;
+      }
+    }
+    if (!candidates.length) return null;
+
+    var prefix = ns.normalizeText(rec.prefix || "");
+    var suffix = ns.normalizeText(rec.suffix || "");
+    var hasPos = Number.isFinite(rec.textPos) && Number.isFinite(rec.docLength) && rec.docLength > 0;
+
+    var best = null;
+    var bestScore = -Infinity;
+    candidates.forEach(function (ci) {
+      var rawStart = norm.map[ci];
+      var rawEnd   = norm.map[ci + needle.length - 1] + 1;
+      if (overlapsAny(occupied, rawStart, rawEnd)) return;
+
+      var before = haystack.slice(Math.max(0, ci - prefix.length - 1), ci).trim();
+      var after  = haystack.slice(ci + needle.length, ci + needle.length + suffix.length + 1).trim();
+      var score  = commonSuffixLength(before, prefix) + commonPrefixLength(after, suffix);
+      if (hasPos) {
+        var expected = rec.textPos / rec.docLength;
+        var actual   = rawStart / Math.max(1, map.text.length);
+        score -= Math.abs(expected - actual) * 40;
+      }
+      if (score > bestScore) { bestScore = score; best = { start: rawStart, end: rawEnd }; }
+    });
+    return best;
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
-  // ELIMINAR
+  // ELIMINAR / SINCRONIZAR
   // ══════════════════════════════════════════════════════════════════════════
 
-  HighlightRenderer.prototype.removeHighlightById = async function (id) {
-    var el = this.findHighlightElement(id);
-    if (el) this._unwrap(el);
-    await this.storage.removeHighlight(ns.getDocumentUrl(), id);
-    return Boolean(el);
-  };
-
-  HighlightRenderer.prototype.clearCurrentPage = async function () {
+  HighlightRenderer.prototype.removeHighlightById = function (id) {
     var self = this;
-    var els  = Array.from(document.querySelectorAll("." + ns.HIGHLIGHT_CLASS));
-    els.forEach(function (el) { self._unwrap(el); });
-    await this.storage.clearHighlights(ns.getDocumentUrl());
-    return els.length;
+    return this._enqueue(async function () {
+      var n = self._unwrapId(id);
+      self._discardOwnMutations();
+      await self.storage.removeHighlight(ns.getDocumentUrl(), id);
+      return n > 0;
+    });
+  };
+
+  HighlightRenderer.prototype.clearCurrentPage = function () {
+    var self = this;
+    return this._enqueue(async function () {
+      var ids = self.getRenderedIds();
+      ids.forEach(function (id) { self._unwrapId(id); });
+      self._discardOwnMutations();
+      await self.storage.clearHighlights(ns.getDocumentUrl());
+      return ids.length;
+    });
+  };
+
+  // Ajusta el DOM al estado guardado (cambios hechos desde el popup, la
+  // biblioteca u otra pestaña).
+  HighlightRenderer.prototype.syncWithRecords = function (records) {
+    var self = this;
+    return this._enqueue(async function () {
+      var ids = {};
+      records.forEach(function (r) { ids[r.id] = true; });
+      self.getRenderedIds().forEach(function (id) {
+        if (!ids[id]) self._unwrapId(id);
+      });
+      self._restoreRecords(records);
+      self._discardOwnMutations();
+    });
+  };
+
+  // Quita todas las marcas del DOM sin tocar el almacenamiento (cambio de URL en SPA)
+  HighlightRenderer.prototype.unrenderAll = function () {
+    var self = this;
+    return this._enqueue(async function () {
+      self.getRenderedIds().forEach(function (id) { self._unwrapId(id); });
+      self.unresolvedIds.clear();
+      self._discardOwnMutations();
+    });
   };
 
   // ══════════════════════════════════════════════════════════════════════════
-  // OBSERVER
+  // SELECCIÓN
+  // ══════════════════════════════════════════════════════════════════════════
+
+  HighlightRenderer.prototype.isUiNode = function (node) {
+    var el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
+    return Boolean(el && el.closest(ns.UI_SELECTOR));
+  };
+
+  HighlightRenderer.prototype._liveRange = function () {
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+    var r = sel.getRangeAt(0);
+    if (!ns.normalizeText(r.toString())) return null;
+    if (this.isUiNode(r.commonAncestorContainer)) return null;
+    return r.cloneRange();
+  };
+
+  HighlightRenderer.prototype._currentRange = function () {
+    return this._liveRange() || (this.lastSelectionRange ? this.lastSelectionRange.cloneRange() : null);
+  };
+
+  HighlightRenderer.prototype.rememberCurrentSelection = function () {
+    var r = this._liveRange();
+    if (r) this.lastSelectionRange = r;
+  };
+
+  HighlightRenderer.prototype.getSelectedText = function () {
+    var r = this._currentRange();
+    return r ? ns.normalizeText(r.toString()) : "";
+  };
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // OBSERVER (contenido dinámico)
   // ══════════════════════════════════════════════════════════════════════════
 
   HighlightRenderer.prototype.observeDynamicContent = function () {
@@ -303,130 +568,54 @@
     var self = this;
     this.mutationObserver = new MutationObserver(function (mutations) {
       var relevant = mutations.some(function (m) {
+        if (self.isUiNode(m.target)) return false;
         if (m.type === "characterData") return !self.isInsideHighlight(m.target);
-        return Array.from(m.addedNodes).some(function (n) { return !self.isInsideHighlight(n); });
+        return Array.prototype.some.call(m.addedNodes, function (n) {
+          return !self.isInsideHighlight(n) && !self.isUiNode(n);
+        }) || Array.prototype.some.call(m.removedNodes, function (n) {
+          return n.nodeType === Node.ELEMENT_NODE &&
+            (n.matches("." + ns.HIGHLIGHT_CLASS) || n.querySelector("." + ns.HIGHLIGHT_CLASS));
+        });
       });
-      if (!relevant || self.restoreInFlight) return;
+      if (!relevant) return;
       clearTimeout(self.restoreTimerId);
-      self.restoreTimerId = setTimeout(async function () {
-        self.restoreInFlight = true;
-        try { await self.restoreHighlightsForCurrentPage(); }
-        finally { self.restoreInFlight = false; }
-      }, ns.DYNAMIC_RESTORE_DELAY_MS);
+      // Si lo único pendiente son resaltados que ya no se encontraron, en webs que
+      // cambian sin parar (chats, feeds) no se reescanea más de una vez cada 4 s.
+      var delay = ns.DYNAMIC_RESTORE_DELAY_MS;
+      if (self.unresolvedIds.size && Date.now() - self._lastScanAt < 4000) delay = 4000;
+      self.restoreTimerId = setTimeout(function () {
+        self._lastScanAt = Date.now();
+        void self.restoreHighlightsForCurrentPage().catch(function () {});
+      }, delay);
     });
     this.mutationObserver.observe(document.body, {
       childList: true, characterData: true, subtree: true
     });
   };
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // HELPERS PRIVADOS
-  // ══════════════════════════════════════════════════════════════════════════
-
-  // Devuelve el mark si el rango completo está dentro de él (un único mark)
-  HighlightRenderer.prototype._containingMark = function (range) {
-    var startMark = this.findHighlightElementForNode(range.startContainer);
-    var endMark   = this.findHighlightElementForNode(range.endContainer);
-    if (startMark && startMark === endMark) return startMark;
-    // Caso: el ancestro común ES el mark
-    var anc = range.commonAncestorContainer;
-    var el  = anc.nodeType === Node.ELEMENT_NODE ? anc : anc.parentElement;
-    return el ? el.closest("." + ns.HIGHLIGHT_CLASS) : null;
-  };
-
-  // True si el rango abarca todo el texto del elemento
-  HighlightRenderer.prototype._coversFull = function (range, el) {
-    return ns.normalizeText(range.toString()) === ns.normalizeText(el.textContent || "");
-  };
-
-  // Marks que se solapan con el rango
-  HighlightRenderer.prototype._overlappingMarks = function (range) {
-    return Array.from(document.querySelectorAll("." + ns.HIGHLIGHT_CLASS))
-      .filter(function (m) { return range.intersectsNode(m); });
-  };
-
-  // Crear el elemento <mark> con clases y atributos
-  HighlightRenderer.prototype._makeMarkEl = function (rec) {
-    var m = document.createElement("mark");
-    m.className = ns.HIGHLIGHT_CLASS + " " + ns.HIGHLIGHT_CLASS + "--" + rec.color;
-    m.setAttribute(ns.HIGHLIGHT_ATTR, rec.id);
-    m.setAttribute("data-ph-color", rec.color);
-    if (rec.customColor) m.style.setProperty("--ph-custom-highlight", rec.customColor);
-    return m;
-  };
-
-  // Clonar un record con nuevo id (y opcionalmente nuevo color/text)
-  HighlightRenderer.prototype._cloneRec = function (orig, newText, newColor, newCustom) {
-    return Object.assign({}, orig, {
-      id:           ns.createId(),
-      selectedText: newText !== undefined ? newText : orig.selectedText,
-      color:        newColor !== undefined ? newColor : orig.color,
-      customColor:  newCustom !== undefined ? newCustom : orig.customColor
-    });
-  };
-
-  // Aplicar color a un element existente
-  HighlightRenderer.prototype._setColor = function (el, color, custom) {
-    var classes = ns.COLOR_OPTIONS.map(function (o) { return ns.HIGHLIGHT_CLASS + "--" + o.id; });
-    classes.push(ns.HIGHLIGHT_CLASS + "--custom");
-    el.classList.remove.apply(el.classList, classes);
-    el.classList.add(ns.HIGHLIGHT_CLASS + "--" + color);
-    el.setAttribute("data-ph-color", color);
-    if (custom) el.style.setProperty("--ph-custom-highlight", custom);
-    else el.style.removeProperty("--ph-custom-highlight");
-  };
-
-  // Envolver rango en un <mark>
-  HighlightRenderer.prototype._wrap = function (range, record) {
-    var mark = this._makeMarkEl(record);
-    mark.appendChild(range.extractContents());
-    range.insertNode(mark);
-    mark.normalize();
-  };
-
-  // Quitar el <mark> dejando el texto intacto
-  HighlightRenderer.prototype._unwrap = function (el) {
-    var p = el.parentNode;
-    if (!p) return;
-    while (el.firstChild) p.insertBefore(el.firstChild, el);
-    p.removeChild(el);
-    p.normalize();
-  };
-
-  // Construir el record de datos completo
-  HighlightRenderer.prototype._buildRecord = function (range, selText, color, url, custom) {
-    var prefix  = this.getContextSnippet(range, "prefix");
-    var suffix  = this.getContextSnippet(range, "suffix");
-    var domHint = this.getDomHint(range.commonAncestorContainer);
-    return {
-      id:             ns.createId(),
-      url:            url,
-      selectedText:   selText,
-      color:          color,
-      customColor:    custom,
-      createdAt:      new Date().toISOString(),
-      surroundingText: (prefix + selText + suffix).trim(),
-      prefix:         prefix,
-      suffix:         suffix,
-      startXPath:     this.getXPathForNode(range.startContainer),
-      endXPath:       this.getXPathForNode(range.endContainer),
-      startOffset:    range.startOffset,
-      endOffset:      range.endOffset,
-      domHint:        domHint,
-      signature:      ns.buildSignature(selText, prefix, suffix, domHint),
-      comment:        "",
-      tags:           [],
-      isFavorite:     false,
-      category:       (ns.COLOR_OPTIONS.find(function (o) { return o.id === color; }) || {}).category || "general"
-    };
+  HighlightRenderer.prototype._discardOwnMutations = function () {
+    if (this.mutationObserver) this.mutationObserver.takeRecords();
   };
 
   // ══════════════════════════════════════════════════════════════════════════
-  // API PÚBLICA (usada desde content.js, popup, storage)
+  // CONSULTAS
   // ══════════════════════════════════════════════════════════════════════════
+
+  HighlightRenderer.prototype.getHighlightElements = function (id) {
+    return Array.from(document.querySelectorAll("[" + ns.HIGHLIGHT_ATTR + '="' + CSS.escape(id) + '"]'));
+  };
 
   HighlightRenderer.prototype.findHighlightElement = function (id) {
     return document.querySelector("[" + ns.HIGHLIGHT_ATTR + '="' + CSS.escape(id) + '"]');
+  };
+
+  HighlightRenderer.prototype.getRenderedIds = function () {
+    var seen = {};
+    Array.from(document.querySelectorAll("." + ns.HIGHLIGHT_CLASS)).forEach(function (m) {
+      var id = m.getAttribute(ns.HIGHLIGHT_ATTR);
+      if (id) seen[id] = true;
+    });
+    return Object.keys(seen);
   };
 
   HighlightRenderer.prototype.findHighlightElementForNode = function (node) {
@@ -436,164 +625,22 @@
   };
 
   HighlightRenderer.prototype.isInsideHighlight = function (node) {
-    var el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    return Boolean(el && el.closest("." + ns.HIGHLIGHT_CLASS));
+    return Boolean(this.findHighlightElementForNode(node));
   };
 
-  HighlightRenderer.prototype.unwrapHighlight = function (el) { this._unwrap(el); };
-  HighlightRenderer.prototype.updateHighlightElementColor = function (el, c, cu) { this._setColor(el, c, cu); };
-
-  // ── Buscar range para restaurar un record guardado ────────────────────────
-  HighlightRenderer.prototype.findRangeForRecord = function (record) {
-    // Intentar por XPath
-    var r = this.tryRangeFromDescriptor(record);
-    if (r) return r;
-    // Búsqueda por texto
-    var roots = this.getSearchRoots(record);
-    for (var ri = 0; ri < roots.length; ri++) {
-      var map = this.buildTextMap(roots[ri]);
-      if (!map.text) continue;
-      var idx = 0;
-      while (idx < map.text.length) {
-        var mi = map.text.indexOf(record.selectedText, idx);
-        if (mi === -1) break;
-        var ei  = mi + record.selectedText.length;
-        var pre = map.text.slice(Math.max(0, mi - (record.prefix || "").length), mi);
-        var suf = map.text.slice(ei, ei + (record.suffix || "").length);
-        if (record.prefix && !pre.endsWith(record.prefix))   { idx = mi + 1; continue; }
-        if (record.suffix && !suf.startsWith(record.suffix)) { idx = mi + 1; continue; }
-        var range2 = this.createRangeFromOffsets(map.entries, mi, ei);
-        if (range2 && ns.normalizeText(range2.toString()) === ns.normalizeText(record.selectedText)) {
-          return range2;
-        }
-        idx = mi + 1;
-      }
-    }
-    return null;
-  };
-
-  // Alias del viejo código (conservados para compat)
-  HighlightRenderer.prototype.wrapRange = function (range, record) { this._wrap(range, record); };
-  HighlightRenderer.prototype.createRecordFromRange = function (range, selText, color, url, custom) {
-    return this._buildRecord(range, selText, color, url, custom);
-  };
-  HighlightRenderer.prototype.isRangeHighlightable = function (range) {
-    // Ahora siempre aceptamos — el split/merge lo gestiona applySelectionHighlight
-    return !this.isInsideHighlight(range.commonAncestorContainer) ||
-           Boolean(this.findHighlightElementForNode(range.commonAncestorContainer));
-  };
-
-  // ── Helpers de búsqueda de texto (conservados) ────────────────────────────
-  HighlightRenderer.prototype.tryRangeFromDescriptor = function (record) {
-    if (!record.startXPath || !record.endXPath) return null;
-    try {
-      var sn = this.getNodeByXPath(record.startXPath);
-      var en = this.getNodeByXPath(record.endXPath);
-      if (!sn || !en) return null;
-      var r = document.createRange();
-      r.setStart(sn, Math.min(record.startOffset || 0, this.getNodeLength(sn)));
-      r.setEnd(en,   Math.min(record.endOffset   || 0, this.getNodeLength(en)));
-      return ns.normalizeText(r.toString()) === ns.normalizeText(record.selectedText) ? r : null;
-    } catch (_e) { return null; }
-  };
-
-  HighlightRenderer.prototype.getSearchRoots = function (record) {
-    var roots = [];
-    if (record.domHint) {
-      try { var h = document.querySelector(record.domHint); if (h) roots.push(h); } catch (_e) {}
-    }
-    if (record.startXPath) {
-      var segs = record.startXPath.split("/"); segs.pop();
-      var pp = segs.join("/");
-      if (pp) { try { var pn = this.getNodeByXPath(pp); if (pn) roots.push(pn); } catch (_e) {} }
-    }
-    if (document.body && roots.indexOf(document.body) === -1) roots.push(document.body);
-    return roots;
-  };
-
-  HighlightRenderer.prototype.buildTextMap = function (root) {
-    var HL = ns.HIGHLIGHT_CLASS;
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode: function (node) {
-        if (!node.textContent || !node.textContent.trim()) return NodeFilter.FILTER_REJECT;
-        var pe = node.parentElement;
-        if (!pe) return NodeFilter.FILTER_REJECT;
-        if (pe.closest("." + HL + ", script, style, noscript, textarea, input"))
-          return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
+  HighlightRenderer.prototype.scrollToHighlight = function (id) {
+    var marks = this.getHighlightElements(id);
+    if (!marks.length) return false;
+    marks[0].scrollIntoView({ behavior: "smooth", block: "center" });
+    marks.forEach(function (m) {
+      m.classList.remove("ph-highlight--flash");
+      void m.offsetWidth;
+      m.classList.add("ph-highlight--flash");
     });
-    var text = "", entries = [], cur = walker.nextNode();
-    while (cur) {
-      var s = text.length;
-      text += cur.textContent || "";
-      entries.push({ node: cur, start: s, end: text.length });
-      cur = walker.nextNode();
-    }
-    return { text: text, entries: entries };
-  };
-
-  HighlightRenderer.prototype.createRangeFromOffsets = function (entries, si, ei) {
-    var se = entries.find(function (e) { return si >= e.start && si <= e.end; });
-    var ee = entries.find(function (e) { return ei >= e.start && ei <= e.end; });
-    if (!se || !ee) return null;
-    var r = document.createRange();
-    r.setStart(se.node, si - se.start);
-    r.setEnd(ee.node,   ei - ee.start);
-    return r;
-  };
-
-  HighlightRenderer.prototype.getContextSnippet = function (range, side) {
-    var node = side === "prefix" ? range.startContainer : range.endContainer;
-    if (node.nodeType !== Node.TEXT_NODE) return "";
-    var text = node.textContent || "";
-    return side === "prefix"
-      ? text.slice(Math.max(0, range.startOffset - 40), range.startOffset)
-      : text.slice(range.endOffset, Math.min(text.length, range.endOffset + 40));
-  };
-
-  HighlightRenderer.prototype.getXPathForNode = function (node) {
-    var target = node.nodeType === Node.TEXT_NODE ? node : (node.childNodes[0] || node);
-    if (!target) return undefined;
-    var segs = [], cur = target;
-    while (cur && cur !== document) {
-      if (cur.nodeType === Node.TEXT_NODE) {
-        var tsibs = Array.from(cur.parentNode ? cur.parentNode.childNodes : [])
-          .filter(function (s) { return s.nodeType === Node.TEXT_NODE; });
-        segs.unshift("text()[" + (tsibs.indexOf(cur) + 1) + "]");
-      } else if (cur.nodeType === Node.ELEMENT_NODE) {
-        var esibs = Array.from(cur.parentNode ? cur.parentNode.children : [])
-          .filter(function (s) { return s.tagName === cur.tagName; });
-        segs.unshift(cur.tagName.toLowerCase() + "[" + (esibs.indexOf(cur) + 1) + "]");
-      }
-      cur = cur.parentNode;
-    }
-    return segs.length ? "/" + segs.join("/") : undefined;
-  };
-
-  HighlightRenderer.prototype.getNodeByXPath = function (xpath) {
-    return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-  };
-
-  HighlightRenderer.prototype.getParentNodeByXPath = function (xpath) {
-    var segs = xpath.split("/"); segs.pop();
-    var pp = segs.join("/");
-    return pp ? this.getNodeByXPath(pp) : null;
-  };
-
-  HighlightRenderer.prototype.getNodeLength = function (node) {
-    return node.nodeType === Node.TEXT_NODE ? (node.textContent || "").length : node.childNodes.length;
-  };
-
-  HighlightRenderer.prototype.getDomHint = function (node) {
-    var el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    if (!el) return undefined;
-    var target = el.closest("article, main, section, p, li, blockquote, div") || el;
-    var id = target.getAttribute("id");
-    if (id) return "#" + CSS.escape(id);
-    var cls = Array.from(target.classList).slice(0, 3);
-    if (cls.length) return target.tagName.toLowerCase() + "." + cls.map(CSS.escape).join(".");
-    return target.tagName.toLowerCase();
+    setTimeout(function () {
+      marks.forEach(function (m) { m.classList.remove("ph-highlight--flash"); });
+    }, 1800);
+    return true;
   };
 
   ns.HighlightRenderer = HighlightRenderer;

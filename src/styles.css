@@ -16,28 +16,60 @@
 }
 
 /* ── Resaltados de texto ────────────────────────────────────────────────── */
-.ph-highlight {
+/* Un resaltado puede estar formado por varios <mark> (uno por nodo de texto).
+   Sin padding para que segmentos contiguos no dejen huecos ni se solapen. */
+mark.ph-highlight {
   color: inherit !important;
-  padding: 0.06em 0.08em;
-  border-radius: 0.18em;
-  cursor: text;
-  transition: outline 100ms ease;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 0.15em;
+  cursor: pointer;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  background: #fde047;
+  transition: filter 100ms ease, box-shadow 100ms ease;
 }
-.ph-highlight:hover {
-  outline: 2px solid rgba(0,0,0,0.3);
-  outline-offset: 1px;
+mark.ph-highlight:hover {
+  filter: brightness(0.94) saturate(1.15);
 }
 
-.ph-highlight--yellow { background: #fde047; }
-.ph-highlight--green  { background: #4ade80; }
-.ph-highlight--blue   { background: #60a5fa; }
-.ph-highlight--pink   { background: #f472b6; }
-.ph-highlight--orange { background: #fb923c; }
-.ph-highlight--purple { background: #c084fc; }
-.ph-highlight--teal   { background: #2dd4bf; }
-.ph-highlight--red    { background: #f87171; }
-.ph-highlight--gray   { background: #94a3b8; }
-.ph-highlight--custom { background: var(--ph-custom-highlight, #fde047); }
+/* Los colores llevan transparencia para que el texto se lea también en webs oscuras */
+mark.ph-highlight--yellow { background: rgba(253, 224, 71, 0.75); }
+mark.ph-highlight--green  { background: rgba(74, 222, 128, 0.6); }
+mark.ph-highlight--blue   { background: rgba(96, 165, 250, 0.55); }
+mark.ph-highlight--pink   { background: rgba(244, 114, 182, 0.55); }
+mark.ph-highlight--orange { background: rgba(251, 146, 60, 0.6); }
+mark.ph-highlight--purple { background: rgba(192, 132, 252, 0.55); }
+mark.ph-highlight--teal   { background: rgba(45, 212, 191, 0.55); }
+mark.ph-highlight--red    { background: rgba(248, 113, 113, 0.6); }
+mark.ph-highlight--gray   { background: rgba(148, 163, 184, 0.55); }
+mark.ph-highlight--custom { background: var(--ph-custom-highlight, #fde047); }
+
+/* Indicador de comentario al final del resaltado */
+mark.ph-highlight--has-comment::after {
+  content: "";
+  display: inline-block;
+  width: 0.42em;
+  height: 0.42em;
+  margin-left: 0.15em;
+  vertical-align: super;
+  border-radius: 999px;
+  background: #1d1b19;
+  box-shadow: 0 0 0 1.5px rgba(255,255,255,0.9);
+}
+
+/* Destello al navegar a un resaltado desde el panel o la biblioteca */
+mark.ph-highlight--flash {
+  animation: ph-flash 1.6s ease-out;
+}
+@keyframes ph-flash {
+  0%, 30% { box-shadow: 0 0 0 3px rgba(29, 27, 25, 0.75); }
+  100%    { box-shadow: 0 0 0 3px rgba(29, 27, 25, 0); }
+}
+
+@media print {
+  mark.ph-highlight--has-comment::after { display: none; }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    POST-IT NOTES
@@ -47,6 +79,8 @@
 .ph-note-layer {
   position: absolute;
   top: 0; left: 0;
+  width: 0; height: 0;
+  overflow: visible;
   z-index: 2147483000;
   pointer-events: none;
 }
@@ -285,39 +319,6 @@
 
 .ph-note__body::placeholder {
   color: rgba(0,0,0,0.28);
-}
-
-/* ── Botón flotante de eliminar resaltado (hover) ─────────────────────── */
-.ph-delete-tooltip {
-  position: absolute;
-  z-index: 2147483647;
-  display: none;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px 4px 8px;
-  background: #1e1e1e;
-  color: #fff;
-  font: 600 11px/1 -apple-system, "Segoe UI", Arial, sans-serif;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.08);
-  white-space: nowrap;
-  pointer-events: auto;
-  transition: background 120ms, transform 100ms;
-  transform-origin: bottom left;
-  letter-spacing: 0.01em;
-  user-select: none;
-}
-
-.ph-delete-tooltip:hover {
-  background: #c0392b;
-  transform: scale(1.06);
-}
-
-.ph-delete-tooltip span {
-  font-size: 10px;
-  opacity: 0.75;
 }
 
 /* Floating focus clock and study widget */

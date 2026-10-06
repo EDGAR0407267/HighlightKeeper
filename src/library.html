@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Biblioteca · Annotate</title>
+  <link rel="icon" href="../icons/icon32.png" />
+  <link rel="stylesheet" href="./library.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="top__brand">
+      <span class="top__mark" aria-hidden="true"></span>
+      <div>
+        <p class="eyebrow">Annotate</p>
+        <h1 class="top__title">Biblioteca de apuntes</h1>
+      </div>
+    </div>
+
+    <nav class="views" aria-label="Vistas">
+      <button class="views__btn is-active" data-view="notes" type="button">Apuntes</button>
+      <button class="views__btn" data-view="review" type="button">Repasar <span id="due-badge" class="badge" hidden>0</span></button>
+    </nav>
+
+    <div class="top__actions">
+      <button id="btn-export-md" class="btn" type="button" title="Exporta lo que estás viendo (respeta filtros)">Exportar Markdown</button>
+      <details class="menu">
+        <summary class="btn btn--ghost" title="Copias de seguridad">Copia</summary>
+        <div class="menu__panel">
+          <button id="btn-backup" class="menu__item" type="button">Descargar copia (.json)</button>
+          <label class="menu__item">
+            Importar copia…
+            <input id="input-import" type="file" accept=".json,application/json" hidden />
+          </label>
+        </div>
+      </details>
+    </div>
+  </header>
+
+  <!-- ═════════ VISTA: APUNTES ═════════ -->
+  <main id="view-notes" class="layout">
+    <aside class="pages">
+      <div class="stats" id="stats"></div>
+      <div class="search">
+        <input id="page-search" type="search" placeholder="Filtrar páginas…" autocomplete="off" />
+      </div>
+      <ul id="page-list" class="page-list" aria-label="Páginas"></ul>
+    </aside>
+
+    <section class="content">
+      <div class="filters">
+        <input id="search" class="filters__search" type="search" placeholder="Buscar en resaltados, comentarios, notas y etiquetas…" autocomplete="off" />
+        <div id="color-filters" class="chips" aria-label="Filtrar por color"></div>
+        <div class="filters__row">
+          <select id="tag-filter" class="select" aria-label="Filtrar por etiqueta">
+            <option value="">Todas las etiquetas</option>
+          </select>
+          <label class="check"><input id="only-fav" type="checkbox" /> Favoritos</label>
+          <label class="check"><input id="only-comment" type="checkbox" /> Con comentario</label>
+          <label class="check"><input id="show-notes" type="checkbox" checked /> Notas</label>
+        </div>
+      </div>
+
+      <div id="results" class="results" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <!-- ═════════ VISTA: REPASAR ═════════ -->
+  <main id="view-review" class="review" hidden>
+    <section id="review-setup" class="review__setup card">
+      <h2 class="h2">Sesión de repaso</h2>
+      <p class="muted">Cada resaltado se convierte en una tarjeta. Si tiene comentario, el comentario es la pregunta; si no, verás el contexto con el texto oculto. Lo que aciertas vuelve más tarde (1, 3, 7, 14 y 30 días); lo que fallas, enseguida.</p>
+
+      <div class="grid2">
+        <label class="field">
+          <span>Qué repasar</span>
+          <select id="rv-scope" class="select">
+            <option value="due">Pendientes para hoy</option>
+            <option value="all">Todas las tarjetas</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Página</span>
+          <select id="rv-page" class="select"><option value="">Todas las páginas</option></select>
+        </label>
+        <label class="field">
+          <span>Color</span>
+          <select id="rv-color" class="select"><option value="">Todos los colores</option></select>
+        </label>
+        <label class="field">
+          <span>Etiqueta</span>
+          <select id="rv-tag" class="select"><option value="">Todas las etiquetas</option></select>
+        </label>
+      </div>
+
+      <div class="review__start">
+        <button id="rv-start" class="btn btn--primary btn--lg" type="button">Empezar</button>
+        <p id="rv-count" class="muted"></p>
+      </div>
+    </section>
+
+    <section id="review-session" class="review__session" hidden>
+      <div class="progress"><span id="rv-progress"></span></div>
+      <p id="rv-counter" class="muted center"></p>
+
+      <article class="flash card">
+        <p id="rv-source" class="flash__source"></p>
+        <p id="rv-kind" class="eyebrow"></p>
+        <div id="rv-front" class="flash__front"></div>
+        <div id="rv-back" class="flash__back" hidden>
+          <p class="eyebrow">Respuesta</p>
+          <p id="rv-answer" class="flash__answer"></p>
+          <a id="rv-open" class="link" href="#" target="_blank" rel="noopener">Ver en la página ↗</a>
+        </div>
+      </article>
+
+      <div class="flash__actions">
+        <button id="rv-show" class="btn btn--primary btn--lg" type="button">Mostrar respuesta <kbd>Espacio</kbd></button>
+        <div id="rv-grade" class="flash__grade" hidden>
+          <button id="rv-again" class="btn btn--danger btn--lg" type="button">No lo sabía <kbd>1</kbd></button>
+          <button id="rv-good" class="btn btn--success btn--lg" type="button">Lo sabía <kbd>2</kbd></button>
+        </div>
+      </div>
+      <button id="rv-stop" class="btn btn--ghost center-block" type="button">Terminar sesión</button>
+    </section>
+
+    <section id="review-done" class="review__done card" hidden>
+      <h2 class="h2">¡Sesión terminada!</h2>
+      <p id="rv-summary" class="muted"></p>
+      <button id="rv-again-session" class="btn btn--primary" type="button">Volver a la configuración</button>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="./types.js"></script>
+  <script src="./storage.js"></script>
+  <script src="./library.js"></script>
+</body>
+</html>

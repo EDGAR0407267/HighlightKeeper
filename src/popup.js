@@ -25,16 +25,18 @@
         id: tab.id,
         url: pdfUrl,
         tabUrl: tab.url,
+        title: (tab.title || "").replace(/\s*·\s*Annotate PDF$/, ""),
         isPdf: true,
         isAnnotatePdfViewer: ns.isAnnotatePdfViewerUrl(tab.url)
       };
     }
 
-    if (/^https?:/i.test(tab.url)) {
+    if (/^(https?|file):/i.test(tab.url)) {
       return {
         id: tab.id,
         url: ns.normalizeUrl(tab.url),
         tabUrl: tab.url,
+        title: tab.title || "",
         isPdf: false,
         isAnnotatePdfViewer: false
       };
@@ -66,18 +68,16 @@
     });
   }
 
-  function injectIntoTab(tabId) {
-    return new Promise(function(resolve, reject) {
-      chrome.scripting.insertCSS({ target: { tabId }, files: ["src/styles.css", "src/sidebar.css"] }, function() {
-        chrome.scripting.executeScript(
-          { target: { tabId }, files: ["src/types.js", "src/storage.js", "src/highlighter.js", "src/notes.js", "src/focus.js", "src/content.js", "src/sidebar.js"] },
-          function() {
-            if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-            resolve();
-          }
-        );
+  async function injectIntoTab(tabId) {
+    try {
+      await chrome.scripting.insertCSS({ target: { tabId }, files: ["src/styles.css", "src/sidebar.css"] });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["src/types.js", "src/storage.js", "src/highlighter.js", "src/notes.js", "src/focus.js", "src/toolbar.js", "src/content.js", "src/sidebar.js"]
       });
-    });
+    } catch (err) {
+      throw new Error("Esta pagina no permite extensiones (por ejemplo, la Chrome Web Store o paginas internas de Chrome).");
+    }
   }
 
   async function ensureTabReady() {
@@ -87,8 +87,7 @@
       throw new Error("He abierto el PDF en el visor de Annotate. Espera a que cargue y vuelve a intentarlo.");
     }
     try {
-      await sendMessage({ type: "RESTORE_HIGHLIGHTS" });
-      await sendMessage({ type: "RESTORE_NOTES" });
+      await sendMessage({ type: "PING" });
     } catch (_e) {
       await injectIntoTab(currentTab.id);
     }
@@ -368,7 +367,7 @@
           '<span class="color-dot ' + (record.customColor ? "" : "color-dot--" + record.color) + '"' + chipStyle + '></span>' +
         '</div>' +
         '<div class="hl-row__body">' +
-          '<p class="hl-row__text">' + ns.escapeHtml(ns.truncate(record.selectedText, 120)) + '</p>' +
+          '<p class="hl-row__text hl-row__text--link" title="Ir al resaltado en la pagina">' + ns.escapeHtml(ns.truncate(record.selectedText, 120)) + '</p>' +
           commentHtml +
           (tagsHtml ? '<div class="hl-row__tags">' + tagsHtml + '</div>' : '') +
           '<p class="hl-row__meta">' + ns.formatDate(record.createdAt) + '</p>' +
@@ -378,6 +377,15 @@
           '<button class="icon-action" data-action="comment" title="Editar comentario">Comentario</button>' +
           '<button class="icon-action" data-action="delete" title="Eliminar">Eliminar</button>' +
         '</div>';
+
+      row.querySelector(".hl-row__text").addEventListener("click", async function() {
+        try {
+          const resp = await sendMessage({ type: "SCROLL_TO_HIGHLIGHT", highlightId: record.id });
+          if (resp && resp.ok && resp.data && !resp.data.found) {
+            setStatus("hl-status", "Este resaltado no se encuentra en la pagina (el texto puede haber cambiado).", true);
+          }
+        } catch (_e) {}
+      });
 
       row.querySelector('[data-action="favorite"]').addEventListener("click", async function() {
         await storage.patchHighlight(currentTab.url, record.id, { isFavorite: !record.isFavorite });
@@ -395,8 +403,8 @@
       row.querySelector('[data-action="delete"]').addEventListener("click", async function() {
         const ok = await confirm('Eliminar este resaltado?\n"' + ns.truncate(record.selectedText, 60) + '"');
         if (!ok) return;
+        // El content script quita el resaltado de la pagina al detectar el cambio
         await storage.removeHighlight(currentTab.url, record.id);
-        try { await sendMessage({ type: "REMOVE_HIGHLIGHT", highlightId: record.id }); } catch (_e) {}
         await refreshHighlights();
       });
 
@@ -573,8 +581,8 @@
     await storage.saveSettings({ readingMode: next });
     $("btn-reading-mode").classList.toggle("is-active", next);
     $("btn-reading-mode").setAttribute("aria-pressed", String(next));
-    // Envía señal a la pestaña para ocultar/mostrar las notas
-    try { await sendMessage({ type: next ? "HIDE_NOTES" : "RESTORE_NOTES" }); } catch (_e) {}
+    // Las pestañas abiertas ocultan/muestran las notas al detectar el cambio de ajustes
+    setStatus("note-status", next ? "Modo lectura: notas ocultas en todas las paginas." : "Notas visibles de nuevo.");
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -711,7 +719,9 @@
 
     let items = _orgHighlights.slice();
 
-    if (orgFilter !== "all") {
+    if (orgFilter === "untagged") {
+      items = items.filter(function(h) { return !(h.tags && h.tags.length); });
+    } else if (orgFilter !== "all") {
       items = items.filter(function(h) { return (h.tags || []).includes(orgFilter); });
     }
 
@@ -839,61 +849,36 @@
   }
 
   // ═══════════════════════════════════════════════════════════
-  // TAB: STUDY — Flashcards + Export
+  // TAB: UTILIDADES — Exportación + temporizador
   // ═══════════════════════════════════════════════════════════
 
-  let _fcCards  = [];
-  let _fcIdx    = 0;
-  let _fcFlipped = false;
-
   function initStudyTab() {
-    const tab = document.querySelector('[data-tab="study"]');
-    if (!tab) return;
-
     initFocusPanel();
-
-    // Export buttons
     $("btn-export-md").addEventListener("click", function()        { exportFormatted("md"); });
     $("btn-export-txt").addEventListener("click", function()       { exportFormatted("txt"); });
     $("btn-export-json-page").addEventListener("click", function() { exportFormatted("json"); });
-    $("btn-export-all-md").addEventListener("click", function()    { exportAll("md"); });
+    $("btn-export-all-md").addEventListener("click", exportAll);
   }
 
   async function exportFormatted(fmt) {
     if (!currentTab) return setStatus("export-status", "Sin pagina activa.", true);
     const hl    = await storage.getHighlights(currentTab.url);
     const notes = await storage.getNotes(currentTab.url);
-    const title = document.title || currentTab.url;
-    const date  = new Date().toLocaleString("es-ES");
-    let content = "";
+    if (!hl.length && !notes.length) return setStatus("export-status", "No hay nada que exportar en esta pagina.", true);
+    const title = currentTab.title || (hl[0] && hl[0].pageTitle) || currentTab.url;
+    const base  = "annotate-" + ns.slugify(title);
 
     if (fmt === "md") {
-      content  = "# " + title + "\n\n";
-      content += "> " + currentTab.url + "\n> Exportado: " + date + "\n\n";
-      if (hl.length) {
-        content += "## Resaltados\n\n";
-        hl.forEach(function(h, i) {
-          const cat = (ns.COLOR_OPTIONS.find(function(c) { return c.id === h.color; }) || {}).label || h.color;
-          content += (i + 1) + ". **[" + cat + "]** " + h.selectedText + "\n";
-          if (h.comment) content += "   > Comentario: " + h.comment + "\n";
-          if (h.tags && h.tags.length) content += "   *Etiquetas: " + h.tags.join(", ") + "*\n";
-          content += "\n";
-        });
-      }
-      if (notes.length) {
-        content += "## Notas\n\n";
-        notes.forEach(function(n) {
-          content += "### " + (n.title || "Sin titulo") + "\n\n" + (n.text || "(vacia)") + "\n\n";
-        });
-      }
+      const withTitle = hl.map(function(h) { return Object.assign({}, h, { pageTitle: h.pageTitle || title }); });
+      ns.downloadText(ns.buildMarkdownExport(withTitle, notes, title), base + ".md", "text/markdown");
     } else if (fmt === "txt") {
-      content  = title + "\n" + currentTab.url + "\nExportado: " + date + "\n\n";
+      let content = title + "\n" + currentTab.url + "\nExportado: " + new Date().toLocaleString("es-ES") + "\n\n";
       if (hl.length) {
         content += "=== RESALTADOS ===\n\n";
         hl.forEach(function(h, i) {
-          content += (i + 1) + ". " + h.selectedText + "\n";
+          content += (i + 1) + ". [" + ns.getColorLabel(h.color) + "] " + h.selectedText + "\n";
           if (h.comment) content += "   Comentario: " + h.comment + "\n";
-          if (h.tags && h.tags.length) content += "   [" + h.tags.join(", ") + "]\n";
+          if (h.tags && h.tags.length) content += "   Etiquetas: " + h.tags.join(", ") + "\n";
           content += "\n";
         });
       }
@@ -903,127 +888,20 @@
           content += "[" + (n.title || "Sin titulo") + "]\n" + (n.text || "") + "\n\n";
         });
       }
-    } else { // json
-      content = JSON.stringify({ url: currentTab.url, exportedAt: date, highlights: hl, notes: notes }, null, 2);
-    }
-
-    const ext  = fmt === "json" ? "json" : (fmt === "md" ? "md" : "txt");
-    const mime = fmt === "json" ? "application/json" : "text/plain";
-    const blob = new Blob([content], { type: mime + ";charset=utf-8" });
-    const a    = document.createElement("a");
-    a.href     = URL.createObjectURL(blob);
-    a.download = "annotate-" + new Date().toISOString().slice(0, 10) + "." + ext;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    setStatus("export-status", "Exportado como " + ext.toUpperCase() + ".");
-  }
-
-  async function exportAll(fmt) {
-    const data = await storage.exportAll();
-    let content = "# Annotate - Todos los resaltados\nExportado: " + new Date().toLocaleString("es-ES") + "\n\n";
-    const byUrl = {};
-    (data.highlights || []).forEach(function(h) {
-      if (!byUrl[h.url]) byUrl[h.url] = [];
-      byUrl[h.url].push(h);
-    });
-    Object.keys(byUrl).forEach(function(url) {
-      content += "## " + url + "\n\n";
-      byUrl[url].forEach(function(h, i) {
-        const cat = (ns.COLOR_OPTIONS.find(function(c) { return c.id === h.color; }) || {}).label || h.color;
-        content += (i + 1) + ". **[" + cat + "]** " + h.selectedText + "\n";
-        if (h.comment) content += "   > " + h.comment + "\n";
-        content += "\n";
-      });
-    });
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const a    = document.createElement("a");
-    a.href     = URL.createObjectURL(blob);
-    a.download = "annotate-all-" + new Date().toISOString().slice(0, 10) + ".md";
-    a.click();
-    URL.revokeObjectURL(a.href);
-    setStatus("export-status", "Exportacion completa preparada.");
-  }
-
-  async function startFlashcards() {
-    if (!currentTab) { setStatus("fc-status", "Sin pagina activa.", true); return; }
-    const colorFilter = $("fc-color-filter").value;
-    const mode        = $("fc-mode").value;
-    let hl = await storage.getHighlights(currentTab.url);
-
-    if (colorFilter !== "all") {
-      hl = hl.filter(function(h) { return h.color === colorFilter; });
-    }
-
-    if (mode === "qa") {
-      // In Q&A mode, only use items that have a comment (the comment becomes the "answer")
-      const withComment = hl.filter(function(h) { return h.comment && h.comment.trim(); });
-      if (withComment.length) hl = withComment;
-    }
-
-    if (!hl.length) {
-      setStatus("fc-status", "No hay resaltados" + (colorFilter !== "all" ? " con ese color" : "") + (mode === "qa" ? " con comentarios" : "") + ".", true);
-      return;
-    }
-
-    // Shuffle
-    _fcCards  = hl.slice().sort(function() { return Math.random() - 0.5; });
-    _fcIdx    = 0;
-    _fcFlipped = false;
-
-    $("fc-config").hidden = true;
-    $("fc-active").hidden = false;
-    showCard();
-  }
-
-  function stopFlashcards() {
-    $("fc-active").hidden = true;
-    $("fc-config").hidden = false;
-    setStatus("fc-status", "");
-  }
-
-  function showCard() {
-    if (!_fcCards.length) return;
-    _fcFlipped = false;
-    const card = _fcCards[_fcIdx];
-    const mode = $("fc-mode").value;
-    const total = _fcCards.length;
-
-    $("fc-progress-text").textContent = (_fcIdx + 1) + " / " + total;
-    $("fc-progress-fill").style.width = (100 * (_fcIdx + 1) / total) + "%";
-
-    const frontText = document.getElementById("fc-front-text");
-    const backText  = document.getElementById("fc-back-text");
-    const frontLabel = document.getElementById("fc-front-label");
-    const frontFace = document.getElementById("fc-card-front");
-    const backFace  = document.getElementById("fc-card-back");
-
-    if (mode === "qa" && card.comment) {
-      frontLabel.textContent = "Pregunta";
-      frontText.textContent  = card.comment.trim();
-      backText.textContent   = card.selectedText;
+      ns.downloadText(content, base + ".txt", "text/plain");
     } else {
-      const cat = (ns.COLOR_OPTIONS.find(function(c) { return c.id === card.color; }) || {}).label || card.color;
-      frontLabel.textContent = cat + " - Recuerda el contenido";
-      frontText.textContent  = ns.truncate(card.selectedText, 30).replace(/\S+/g, "_____");
-      backText.textContent   = card.selectedText;
+      const json = JSON.stringify({ url: currentTab.url, title: title, exportedAt: new Date().toISOString(), highlights: hl, notes: notes }, null, 2);
+      ns.downloadText(json, base + ".json", "application/json");
     }
-
-    frontFace.hidden = false;
-    backFace.hidden  = true;
-    $("fc-btn-flip").textContent = "Mostrar respuesta";
-
-    // Animate
-    const cardEl = $("fc-card");
-    cardEl.style.animation = "none";
-    void cardEl.offsetWidth;
-    cardEl.style.animation = "";
+    setStatus("export-status", "Exportado como " + fmt.toUpperCase() + ".");
   }
 
-  function flipCard() {
-    _fcFlipped = !_fcFlipped;
-    document.getElementById("fc-card-front").hidden = _fcFlipped;
-    document.getElementById("fc-card-back").hidden  = !_fcFlipped;
-    $("fc-btn-flip").textContent = _fcFlipped ? "Mostrar pregunta" : "Mostrar respuesta";
+  async function exportAll() {
+    const data = await storage.exportAll();
+    if (!data.highlights.length && !data.notes.length) return setStatus("export-status", "Todavia no hay apuntes guardados.", true);
+    const md = ns.buildMarkdownExport(data.highlights, data.notes, "Annotate — Todos mis apuntes");
+    ns.downloadText(md, "annotate-todo-" + new Date().toISOString().slice(0, 10) + ".md", "text/markdown");
+    setStatus("export-status", "Exportacion completa preparada.");
   }
 
   function clampInt(value, min, max, fallback) {
@@ -1235,13 +1113,7 @@
 
   async function exportData() {
     const data = await storage.exportAll();
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href     = url;
-    a.download = "annotate-backup-" + new Date().toISOString().slice(0, 10) + ".json";
-    a.click();
-    URL.revokeObjectURL(url);
+    ns.downloadText(JSON.stringify(data, null, 2), "annotate-backup-" + new Date().toISOString().slice(0, 10) + ".json", "application/json");
     setStatus("dash-status", "Copia exportada.");
   }
 
@@ -1286,6 +1158,16 @@
     // Sidebar toggle
     try { $("btn-sidebar").addEventListener("click", toggleSidebarOnPage); } catch (_e) {}
 
+    // Biblioteca
+    $("btn-library").addEventListener("click", function() {
+      chrome.tabs.create({ url: chrome.runtime.getURL("src/library.html") });
+      window.close();
+    });
+
+    $("btn-shortcuts").addEventListener("click", function() {
+      chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
+    });
+
     // Organize tab
     initOrganize();
     initTagModal();
@@ -1306,6 +1188,15 @@
     $("btn-reading-mode").setAttribute("aria-pressed", String(settings.readingMode));
     $("custom-color-input").value = settings.customColor;
     renderSettings();
+
+    $("set-selection-toolbar").checked = settings.selectionToolbar;
+    $("set-pdf-viewer").checked = settings.openPdfInViewer;
+    $("set-selection-toolbar").addEventListener("change", function(e) {
+      void storage.saveSettings({ selectionToolbar: e.target.checked });
+    });
+    $("set-pdf-viewer").addEventListener("change", function(e) {
+      void storage.saveSettings({ openPdfInViewer: e.target.checked });
+    });
     initMoreColorsToggle();
 
     const focusState = await storage.getFocusState();
@@ -1343,16 +1234,11 @@
       try {
         const s = await storage.getSettings();
         await ensureTabReady();
-        // Resolver colores extra (ex-*) a custom + hex
-        let finalColor = s.selectedColor;
-        let finalCustom = s.customColor;
-        if (finalColor && finalColor.startsWith("ex-")) {
-          const extraOpt = ns.EXTRA_COLOR_OPTIONS.find(function(o) { return o.id === finalColor; });
-          if (extraOpt) { finalCustom = extraOpt.hex; finalColor = "custom"; }
-        }
-        const resp = await sendMessage({ type: "APPLY_HIGHLIGHT", color: finalColor, customColor: finalCustom });
+        const resolved = ns.resolveHighlightColor(s.selectedColor, s.customColor);
+        const resp = await sendMessage({ type: "APPLY_HIGHLIGHT", color: resolved.color, customColor: resolved.customColor });
         if (!resp || !resp.ok) throw new Error(resp ? resp.error : "Sin respuesta.");
         await refresh();
+        setStatus("hl-status", "Resaltado guardado. Consejo: selecciona texto en la pagina y usa la barra flotante.");
       } catch (err) {
         setStatus("hl-status", err.message, true);
       }
@@ -1377,8 +1263,13 @@
       setStatus("hl-status", "Trabajando...");
       try {
         await ensureTabReady();
+        const resp = await sendMessage({ type: "RESTORE_HIGHLIGHTS" });
+        await sendMessage({ type: "RESTORE_NOTES" });
         await refresh();
-        setStatus("hl-status", "Resaltados reaplicados.");
+        const unresolved = resp && resp.ok && resp.data ? resp.data.unresolved : 0;
+        setStatus("hl-status", unresolved
+          ? "Reaplicados. " + unresolved + " resaltado(s) no se encuentran: el texto de la pagina ha cambiado."
+          : "Resaltados reaplicados.", Boolean(unresolved));
       } catch (err) {
         setStatus("hl-status", err.message, true);
       }
